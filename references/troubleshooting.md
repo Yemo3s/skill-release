@@ -1,0 +1,534 @@
+# 排错
+
+按「看到的报错」查，不按模块查。
+
+---
+
+## 一、上传被平台拒了
+
+### `不允许的文件类型: LICENSE`
+
+**原因**：SkillHub 按扩展名白名单过滤，**无扩展名文件一律拒**，且是整包被拒。
+
+**定位**：
+
+```bash
+$PY "$SR" check <技能目录> --targets skillhub
+```
+
+会直接列出所有无扩展名文件。
+
+**修法**：改名为 `<原名>.txt`，并同步代码里的引用。
+`douyin-downloader` 上踩过两次（`LICENSE`、`VERSION`），两个都要改。
+
+### `目录层级超限 — Skill 包仅支持两级目录结构`
+
+**原因**：open.workbuddy 的规则是「根目录 / 二级目录 / 文件」。
+**含外层目录最多 3 段**。`skills/scripts/_sign/sm3.py` 是 4 段。
+
+**定位**：
+
+```bash
+$PY "$SR" check <技能目录> --targets workbuddy
+```
+
+**修法**：把第三层目录里的文件上提到上一层。若原目录名有意义，给文件名加前缀
+（如 `_sign/__init__.py` → `signing.py`，其余同名上提）。
+
+⚠️ 上提后要同步相对导入：`from .x import` → `from x import`，以及所有引用点。
+`douyin-downloader` 那次改了 10 处（7 处相对导入 + 3 处调用方）。
+
+### `SKILL.md 缺少 slug` / `缺少 displayName` / `缺少 author`
+
+这三项**不需要改源文件** —— 本技能会把它们投影到临时副本：
+
+| 字段 | 来源 |
+|---|---|
+| `slug` | 取 `slug`，否则由 `name` 推导 |
+| `displayName` | 取 `displayName`，否则由 `display_name` / `display_name_en` / `slug` 推导 |
+| `author` | 取配置的 `author` |
+
+`check` 报这三项失败时说明**推导不出来**，才需要处理：
+
+- `slug`：SKILL.md 里 `name` 也是空的 → 补一个 kebab-case 的 `name`
+- `author`：`$PY "$SR" creds --set author=<你的展示名>`
+
+---
+
+## 二、SkillHub
+
+### `API Key 无效或已失效（401）` / `会话 Cookie 无效或已失效（401）`
+
+两条通道，换一条或换一份：
+
+```bash
+$PY "$SR" creds --set skillhub.key=skh_xxxx                          # A：签发 Key
+$PY "$SR" creds --set skillhub.cookie='skh_token=<JWT>; sid=<sid>'   # B：浏览器 Cookie
+```
+
+**如果 Cookie 明明是新复制的还是 401**，按顺序查这三条：
+
+1. **是不是把 `skh_token` 的 JWT 当 Bearer 用了**。它俩不是一个东西 ——
+   JWT 塞进 `Authorization` 一定 401，只能放在 `Cookie` 里。
+2. **是不是两条通道同时带了**。Cookie + `Authorization: Bearer` 一起发，
+   服务端会回 `{"error":"invalid or expired token"}`。配了 Cookie 就只发 Cookie。
+3. **host 是不是 `api.skillhub.cn`**。`www.skillhub.cn` / `skillhub.cn` 对
+   `/api/...` 回的是 SPA 的 HTML 壳（HTTP 200 + `<!DOCTYPE html>`），
+   容易被误认为「通了」。
+
+### `不允许的文件类型: icon.png`
+
+图标不是内容文件，是**平台元数据**，不能塞进 `files` 清单。
+本技能已自动剔除**根目录**下的 `icon.*`（`icon.png` / `jpg` / `webp` / `svg` / `gif`），
+所以正常不该再遇到。若仍出现，说明图标不在根目录 —— 子目录里的 png 不在
+排除范围内（那种情况属于未验证类型，`check` 会先给 warn）。
+
+发布后在 SkillHub 详情页手动设 `iconUrl` 即可（官方 CLI 同样不传头像）。
+
+### `slug 冲突（409）` / `slug 已被封禁`
+
+先分清三种：
+
+| 现象 | 含义 | 怎么办 |
+|---|---|---|
+| `reason: "taken"` | 被别人占了 | 换 slug |
+| `reason: "banned"` | **该 slug 被封禁** | 换 slug，争不回来 |
+| 你自己的 slug | 只是想更新已有技能 | 照原 slug 发即可，会自动更新 |
+
+查清再动手：
+
+```bash
+# 单个 slug 是否可用（含 reason）
+GET https://api.skillhub.cn/api/v1/community/skills/check-slug?slug=NAME
+
+# 我已有哪些技能（slug / banned / status）
+GET https://api.skillhub.cn/api/v1/dashboard/skills
+```
+
+被封禁时不要改技能名去迁就平台 —— 写进配置：
+
+```bash
+$PY "$SR" creds --set skillhub.slug_map='{"原slug": "平台可用的slug"}'
+```
+
+或临时一次性：`publish <dir> --yes --targets skillhub --slug <别的slug>`。
+
+> 实例：`douyin-downloader` 这个 slug 被封禁，该技能在 SkillHub 上实际用的是
+> 复数的 `douyin-downloaders`。若不查一下，会误判成「新建」并反复失败。
+
+### `发布过于频繁（429）`
+
+服务端按 token / IP 做多维限流。服务端会回 `retryAfter`，按提示等待即可。
+**不要写循环重试** —— 会把本机 IP 打进更严的策略里。
+
+### 状态一直是 `pending_review`
+
+审核 1–3 个工作日。审核通过前详情页与搜索均不可见，属正常。
+查询：skillhub.cn → 个人中心 → 我的 Skill。
+
+---
+
+## 三、open.workbuddy
+
+### `会话已失效：接口被重定向到 Keycloak 登录页` ／ `返回登录页 HTML 而非 JSON`
+
+最常见，也最容易误判。该站前面是 APISIX，未认证的 `/api/v2/...` 会 **302** 到
+`/auth/realms/copilot/...`；一旦跟随重定向，最终就是「HTTP 200 + 登录页 HTML」。
+**光看状态码会把一个完全没登录的会话报成通过。**
+
+先分三种情况，`probe` 会替你分：
+
+```bash
+$PY "$SR" probe
+```
+
+- 四个端点全部 `会话失效` → Cookie 完全没被认（下面两类）
+- 只有部分端点失效 → 会话有效但缺权限，看 `X-Party-Id` / `X-Enterprise-Id`
+
+### 情况 A：Cookie 是坏的（复制被截断）—— **最高频**
+
+`session` 是本站唯一的鉴权凭据，而且**登录后会长到约 4 KB**（里面塞着
+id_token / access_token / refresh_token）。**这种长度的值手工选中复制几乎必然被截断。**
+
+本站签发形状是**固定**的：
+
+```
+<22 位 id> | <10 位过期戳> | <payload> | <27 位 HMAC>
+    22           10             不定          27
+```
+
+未登录采样 `[22, 10, 214, 27]`，总长 276。
+
+本机踩到的实例：从 DevTools 复制的一串 6.2 KB Cookie 头里，`session` 被截在
+**4001 字符**，末尾的 `|` + 27 位 HMAC **整段丢失** → 服务端 302。
+两次独立复制都恰好 4001 字符 —— 这个「长度一模一样」就是被硬截断的指纹。
+
+`probe` 会先跑 `sniff_cookie()` 报出来：
+
+```
+Cookie 自检：
+  ⚠ session 是 3 段、共 4001 字符，而本站签发的是 4 段
+    `<22位id>|<10位过期>|<payload>|<27位HMAC>` —— 末尾的 `|XXX…`（27 位 HMAC）不见了。
+  ⚠ session 值 4001 字符，已超过 4000 —— 这种长度手工选中复制几乎必然被截断。
+```
+
+**取法：别走剪贴板。**
+
+| 方式 | 怎么做 | 适用 |
+|---|---|---|
+| **HAR 导出**（推荐） | F12 → Network → 刷新 → 右键 → `Save all as HAR` → 把**文件路径**给对方读 | 4 KB 级的 Cookie 值 |
+| **浏览器直读** | 用真实浏览器打开站点、人工登录一次，从浏览器上下文读 Cookie | 一劳永逸，连登录都可省 |
+
+> 🚨 **HAR 导出必须开一个开关，否则拿到的 HAR 里一个 Cookie 都没有。**
+> Chrome 130 起出于隐私考虑，HAR **默认导出「已清理」档** ——
+> Cookie / Set-Cookie / Authorization 全被剥掉（
+> [官方文档](https://developer.chrome.com/docs/devtools/network/reference)）。
+> **症状极具误导性**：HAR 里本站请求一条不少、状态码都是 200，
+> 就是没有 Cookie —— 看起来像「没登录」，实际是导出档位的问题。
+>
+> 开法：**DevTools → 设置（F1）→ 偏好设置 → 网络 →
+> 勾选「允许生成包含敏感数据的 HAR」**，然后点 Network 面板上的
+> **「导出」→ 选「导出 HAR（包含敏感数据）」**（不是默认那项）。
+> 也可以右键请求 → 复制 → 「将所有内容另存为 HAR（包含敏感数据）」。
+>
+> `cookie_from_har()` 会识别这种档位并直接点名，不会让人去查「为什么我没登录」：
+> ```
+> HAR 里 host=open.workbuddy.cn 的 19 条请求**全部没有 Cookie** ——
+> 这不是没登录，是 Chrome 把敏感信息剥掉了。
+> ```
+> 自检口令：`python -c "import json;d=json.load(open('x.har',encoding='utf-8'));print(sum(1 for e in d['log']['entries'] if e['request'].get('cookies')))"`
+> —— 输出 0 就是被剥了。
+
+> ⚠️ 早期版本文档曾把 `qcloud_visitId` / `qcloud_from` / `trafficParams` /
+> `sensorsdata2015jssdkcross` / `session_2` 的出现当作「拿错站」的证据。
+> **实测推翻**：open.workbuddy.cn 自己的已登录请求**就带着它们**（同源埋点），
+> `tgw_l7_route` 也是本站的。这类判据已从 `sniff_cookie()` 里删除，别再照它排除。
+
+> ⚠️ 另一条也被推翻的解读：`Set-Cookie: session_2=; Max-Age=0` 曾被写成
+> 「服务端不认这份会话」。对照实验（本站签发的正常 session / 篡改 HMAC 末位 /
+> 砍掉第 4 段 / 只带 `session_2`）**都不触发**它，只有那份 4001 字符的坏值会触发。
+> 它的含义是「这个 session 值我根本不认」，**不是**「会话过期」，也不能解释成
+> 「`session_2` 不是本站的 Cookie」。**唯一硬判据始终是那个 302。**
+
+**另一个高频陷阱**：`session` 是 **HttpOnly** 的，所以 Console 里跑
+`copy(document.cookie)` 拿到的串**永远不含它** —— 拿到的是残留的统计类 Cookie，
+看起来很像回事，实际必然被 302。别用那个取法。
+
+### 情况 B：真拿错了站
+
+同名同格式的 `session` 在 `cloud.tencent.com` / `console.cloud.tencent.com` 上也存在。
+判据**只有一条**：请求所属域名必须是 `open.workbuddy.cn`。
+
+1. 在 <https://open.workbuddy.cn> 上把登录完整走一遍
+2. F12 → Network → 筛选框输入 `open.workbuddy.cn`，避免误点腾讯云的请求
+3. 找一条 `/api/v2/open-platform/...`（或 `/api/v1/open-platform/...`）的请求
+4. 用上面的 HAR 导出，别手工选中复制
+
+写盘前**不要用 publish 试**，那会产生审核队列里的垃圾：
+
+```bash
+$PY "$SR" probe --cookie "<新 Cookie>"
+$PY "$SR" creds --set workbuddy.cookie='<新 Cookie>'
+```
+
+> 这个站的登录页标题是 `Tencent Cloud CodeBuddy`，但 `form action` 指向
+> `open.workbuddy.cn/auth/realms/copilot/login-actions/authenticate` ——
+> **登录就在本站，不跳腾讯云**。所以正确的 Cookie 一定长在 `open.workbuddy.cn` 上。
+
+### 现场校准（请求体字段名）
+
+**这是本技能唯一需要现场确认的地方，先说清原因。**
+
+第 1 / 3 / 4 / 5 步（presign / init-upload / complete-upload / submit）的
+请求体字段名由页面组件拼装，而组件在**登录后**才加载的路由分块里 ——
+未登录抓不到。因此这三个 body 做成可覆盖配置，不需要改代码。
+
+首跑若报**字段校验错误**，按下面三步校准：
+
+1. 跑一次 `publish --yes --targets workbuddy`，把服务端返回的报错原文看清楚，例如：
+
+   ```
+   init-upload 失败（400）：{"message":"capability_type is required"}
+   ```
+
+2. 把字段名回填到配置：
+
+   ```bash
+   $PY "$SR" creds --set workbuddy.payloads.init_upload.capabilityType=capabilityType
+   ```
+
+   或直接编辑 `~/.workbuddy/.secrets/skill-release.json`：
+
+   ```json
+   {
+     "workbuddy": {
+       "payloads": {
+         "presign":         {"fileName": "{filename}", "fileSize": "{size}", "mimeType": "{mime}"},
+         "init_upload":     {"capabilityType": "{capability_type}", "fileName": "{filename}"},
+         "complete_upload": {"assetId": "{asset_id}", "cosKey": "{cos_key}"},
+         "submit":          {"assetId": "{asset_id}"}
+       }
+     }
+   }
+   ```
+
+   占位符：`{filename}` `{size}` `{mime}` `{capability_type}` `{asset_id}` `{cos_key}`
+
+3. 重跑。资产已经上传成功时（报错发生在 submit 之前），
+   `assetId` 会打在报错里，也可以先在控制台手工提交。
+
+### `直传 COS 失败`
+
+预签名地址有时效。整条链路是连续调用，中间若停顿过久会过期，重跑即可。
+若反复失败，先确认本机能否直连对象存储域名。
+
+### `已上传但 submit 失败`
+
+资产已经在服务端了。报错里会带 `assetId`，可以：
+(a) 控制台手工提交；(b) 校准 `payloads.submit` 后重跑。
+**不要盲目重跑整个流程** —— 会创建重复资产。
+
+---
+
+## 四、GitHub
+
+### `未安装 github-ops，跳过 GitHub`
+
+本技能的 GitHub 部分依赖 `github-ops` 技能（凭据管理 + 推送前密钥扫描）。
+缺失时会在 `doctor` 里报出来。
+
+### 推送被密钥扫描中止
+
+```
+扫描发现达到 high 级别的内容，已中止推送
+```
+
+**这不是 bug，是保护。** 按提示三选一：
+
+1. 从文件里移除该内容后重试；
+2. 确认是文档示例 → 在该行加 `ghscan:allow`；
+3. 确认整个文件无需检查 → 写进 `.ghscanignore`。
+
+命中清单要交给用户判断，**不要自行删改文件**。
+
+### 推上去是空仓库
+
+`ghx.py git push` 只推已有提交、**不做 commit**。
+本技能会先 `git init / add / commit`。若手动调 `ghx` 遇到这情况，
+先在目录里 `git add -A && git commit -m "..."`。
+
+### `未配置 github.owner`
+
+```bash
+$PY "$SR" creds --set github.owner=<GitHub 用户名>
+```
+
+### 提交用了真名 / 公司邮箱（**已修，但存量要清**）
+
+这是本技能最严重的一次事故：首个 `douyin-downloader` 版本推上公开仓库后，
+commit 的作者与提交者都是开发机的**真名 + 公司邮箱**。
+
+**成因是两处叠加**，单看每处都「合理」：
+
+1. `prepare_repo` 原本只在「身份缺失」时才补 noreply，而 `git config user.email`
+   **不带 `--local` 会回退读全局配置**。开发机全局正是真名 + 公司邮箱 → 补全被跳过。
+2. `ghx git push --noreply-identity` 确实设了 local 身份，但它跑在 push 阶段 ——
+   **而 commit 早就生成了**。改身份改在了 commit 之后，纯摆设。
+
+于是「打印着『提交身份已改为 noreply』，真名照样上了公开仓库」。
+
+**现在的三道防线**（任一被绕过都不行）：
+
+| # | 防线 | 实现 |
+|---|---|---|
+| 1 | 身份**无条件**写仓库级 | `prepare_repo`：不再判断是否缺失，直接 `config --local` |
+| 2 | 清掉 `GIT_AUTHOR_*` / `GIT_COMMITTER_*` | 这些环境变量**优先级高于 config**，不清就压不住 |
+| 3 | commit 后、push 前各断言一次 | 邮箱后缀必须是 `@users.noreply.github.com`，否则 `GitHubError` |
+
+第 3 条用**白名单**判据。黑名单（比如「检测公司域名」）永远列不全 ——
+猜不到用户在哪家公司、换过几家。
+
+**发布前先扫一遍存量**（防的是「闸门只拦本次、管不到存量」）：
+
+```bash
+$PY "$SR" audit                 # 扫账号下所有仓库（含私有）
+$PY "$SR" audit --repo OWNER/NAME
+```
+
+判据同样是白名单：邮箱以 `@users.noreply.github.com` 结尾即安全；
+其余与本机全局 git 身份匹配才算命中。详见 [commands.md](./commands.md)。
+
+**重命名仓库不等于清除。** 旧名会重定向到新名，泄漏的 commit 原样保留 ——
+只是从「公开的泄漏」变成「私有的泄漏」。真正要清还是得删库重建。
+
+**本机也要查。** 暂存目录（`~/.workbuddy/.release/<slug>/github`）里有 `.git`，
+历史里那条脏提交同样会随下次推送再出去一次。发现后直接删掉整个暂存目录
+（下次发布会重建），并用 `git log --all --format=%ae` 扫一遍本机其它仓库。
+
+**公共事件档案（gharchive）不会记录作者邮箱。**
+`data.gharchive.org` 是 GitHub 公开事件的第三方归档，但当前格式的
+`PushEvent` 里只有 `repository_id / push_id / ref / head / before`，
+**不含 commit 的 author 字段**（2026-10-10 抽样该小时 28,398 条 PushEvent，
+带 `commits` 字段的为 0）。所以「仓库公开了几分钟」这条路径上，
+泄漏出去的是仓库名与**账号 login**，而不是真名 / 邮箱。
+这只是排除了最可能的一条路径 —— 不能代表所有爬虫都没抓过。
+
+**已经泄漏出去了怎么办**：改代码删不掉 commit 元数据，只能重写历史。
+
+```bash
+git -C <repo> commit --amend --reset-author        # 只有顶端一个提交时
+git filter-repo --email-callback '...'             # 整条历史
+git push --force-with-lease
+```
+
+⚠️ **`force push` 不能算清除**。它改的是分支指向，旧 commit 变成不可达对象；
+GitHub 对不可达对象不会立即回收，**旧 SHA 通常仍可通过 `/<repo>/commit/<sha>`
+直访一段时间**（未逐案实测，取决于 GitHub 的 GC 时机）。
+若该 commit 曾被 PR 引用或被 fork，则可能长期保留。
+
+因此**要确保清除，唯一可靠的做法是删除仓库后重建** —— 旧 commit 立即 404。
+代价是 star / fork / issue 一并丢失，删前先评估，重建后重新推一遍即可。
+
+### 删仓库报 `HTTP 403  Must have admin rights to Repository.`
+
+**不是权限配置错了，是令牌 scope 不够。** 删除仓库需要 `delete_repo`，
+而 `repo` scope **不包含**它 —— 这一点很容易误判，因为 `repo` 看起来已经是全能。
+
+```bash
+$PY "$GHX" auth status      # 看「授权范围」这一行
+```
+
+本机是 `read:user, repo, workflow` → 删库必被拒。
+
+补权限：<https://github.com/settings/tokens> 重新生成 classic token，
+勾上 `delete_repo`；或给 fine-grained token 授
+**Administration: Read and write**。
+
+### 想把 fork 设为私有，报 `Public forks can't be made private`
+
+GitHub 的硬规则：**公开 fork 的可见性跟随 fork 网络，不能单独转私有**。
+`PATCH /repos/{owner}/{repo}` 发 `{"private": true}` 一定返回 422。
+
+必须先**脱离 fork 网络**（Leave fork network）：
+
+| 条件 | 说明 |
+|---|---|
+| fork 是公开的 | 私有 fork 不适用 |
+| fork < 1 GB | 超了只能走「手动脱离」流程 |
+| 没有子 fork | 有人 fork 过你的 fork 就不行 |
+
+**「脱离 fork 网络」只能通过网页操作，REST API 不支持。**
+
+```
+https://github.com/<owner>/<repo>/settings
+→ General → 滚到底部 Danger Zone → Leave fork network
+→ 确认 → 输入仓库名 → 提交
+```
+
+⚠️ 脱离是**不可逆的**，且会丢掉 issues / PR / wiki / star / watcher / 子 fork；
+**但 git commit 元数据会保留** —— 也就是说，光靠这一步清不掉真名 commit，
+只是转私有后外人访问不到了。
+
+#### 脱离之后：改可见性用 API 就行，但要等约 1 分钟
+
+实测（`Yemo3s/GoGoGo`，440 MB，0 子 fork）：点完 Leave fork network 后立刻
+`PATCH private=true` 仍返回同样的 422 —— 切换需要约 1 分钟。判据是元数据里的
+**`fork` 标志变 `false`、`parent` 变 `null`**：
+
+```bash
+# 轮询到 fork=false 再改；提前改只会白挨一次 422
+$PY "$GHX" api GET /repos/<owner>/<repo> --json      # 看 fork / parent
+$PY "$GHX" api PATCH /repos/<owner>/<repo> --field private=true
+```
+
+不要用「网页上 Change visibility 出现了没有」当判据 —— 那要看刷新时机；
+`fork=false` 是服务端事实。
+
+#### 怎么确认真的私有了
+
+**匿名访问的 HTML 应返回 404**，且页面里不再出现 `forked from`：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -H 'User-Agent: Mozilla/5.0' \
+     "https://github.com/<owner>/<repo>?cb=$RANDOM"
+```
+
+三个坑，都踩过：
+
+| 现象 | 真相 |
+|---|---|
+| 匿名返回 **200** | 多半是 CDN 缓存。加随机 query（`?cb=`）再试 |
+| 匿名 **API** 返回 403 | 不等于没私有 —— 未认证配额耗尽（看 `x-ratelimit-remaining: 0`）也是 403。**以 HTML 为准** |
+| 带令牌查是 `private: true` 就放心了 | 不够，令牌视角看不出缓存 / 边缘节点。匿名 HTML 404 才是终判 |
+
+超 1 GB 或想省事，走官方推荐的「手动脱离」：`git clone --bare` → 删 fork →
+建同名新仓库 → `git push --mirror`。删 fork 同样需要 `delete_repo`。
+
+### 手动指定提交身份
+
+默认用 GitHub noreply 形态；想指定别的：
+
+```bash
+$PY "$SR" creds --set github.owner=Yemo3s
+$PY "$SR" creds --set github.uid=103362262     # 让 noreply 带数字 id，能正确归属账号
+```
+
+要完全自定义（**会公开可查**）：
+
+```bash
+$PY "$SR" creds --set github.identity.name=<名字>
+$PY "$SR" creds --set github.identity.email=<邮箱>
+```
+
+`doctor` 会打印本次使用的提交身份，以及全局 git 身份是否安全。
+
+---
+
+## 五、本技能自身
+
+### `--yes` 没生效 / 选项被吃掉
+
+已修。历史 bug 值得记一笔：`opt()` 早期版本用
+`if val not in (None, False) or default is None` 判断，逻辑写反了 ——
+`store_true` 的 `False` 会被当成「已设置」直接返回，导致写在子命令前的
+`--yes` 被子命令级的 `False` 覆盖。
+
+现改为 `add_common` 里一律用 `argparse.SUPPRESS` 作默认值，未设置的选项
+干脆不进 namespace，`opt()` 用 `hasattr` 区分「没给」和「明确给了 False」。
+自检里有 `test_cli` 钉住这个行为。
+
+### 版本号三处不一致
+
+```bash
+$PY "$SR" ../selftest.py      # test_version 会报出来
+```
+
+三处指 `release.py` 的 `__version__`、`VERSION.txt`、`SKILL.md` frontmatter。
+`--bump` 会同时改这三处（以及被发布技能的对应位置）。
+
+### 暂存目录脏了
+
+```bash
+"C:/Users/<你>/.workbuddy/binaries/python/versions/3.13.12/python.exe" -c \
+  "import shutil,pathlib; shutil.rmtree(pathlib.Path.home()/'.workbuddy'/'.release', ignore_errors=True)"
+```
+
+每次 `publish` 都会清空重建对应子目录，正常不会有残留。
+但暂存目录里有 `.git`，**如果里面留着一条带真名的历史，下次推送会把它带出去** ——
+所以 `audit` 扫出问题后，连同这里一起清。Windows 上不要用 `rm -rf`（会被安全策略拦截），
+用上面的 Python 一行命令，它走的是回收站语义。
+
+---
+
+## 六、诊断顺序
+
+遇到任何问题，先按这个顺序跑，多数情况三步内定位：
+
+```bash
+$PY "$SR" doctor                        # 1. 环境和凭据
+$PY "$SR" check <技能目录>               # 2. 规则引擎（带改法）
+$PY "$SR" check <技能目录> --json        # 3. 要喂给脚本/上报时用
+```
+
+发 GitHub 之前在 2 与 3 之间插一步 `$PY "$SR" audit` ——
+它查的是规则引擎查不到的东西：**已经推上去的**历史里有没有你的真名。

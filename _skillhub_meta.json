@@ -1,0 +1,25 @@
+{
+  "name": "skill-release",
+  "installedAt": 0,
+  "source": "local",
+  "version": "1.4.3",
+  "skillId": "",
+  "examples_zh": [
+    "把 douyin-downloader 发布到三个平台",
+    "只更新 skillhub，GitHub 先不动",
+    "发到 open.workbuddy 报目录层级超限，帮我定位",
+    "检查一下这个技能满不满足上架条件",
+    "发个新版本，顺便把版本号升一位",
+    "扫一遍我的 GitHub 账号，看有没有提交带着真名"
+  ],
+  "examples_en": [
+    "Release douyin-downloader to all three platforms",
+    "Only update SkillHub, leave GitHub alone for now",
+    "open.workbuddy rejected my skill for directory depth, help me locate it",
+    "Check whether this skill meets the publishing requirements",
+    "Cut a new release and bump the version",
+    "Audit my GitHub account for commits that leak my real name"
+  ],
+  "description_zh": "把技能一次分发到 GitHub / SkillHub / open.workbuddy，平台字段自动投影到临时副本，两条真实被拒过的平台规则前置成本地断言，默认演练。",
+  "description_en": "Release a skill to GitHub / SkillHub / open.workbuddy in one command, with platform metadata projected into a staging copy and the two rules platforms actually rejected turned into local assertions."
+}
