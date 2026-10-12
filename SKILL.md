@@ -5,7 +5,7 @@ display_name_en: Skill Release Manager
 description: "把本地技能一句话发到 GitHub / SkillHub / open.workbuddy 三处，并把两个平台的校验规则前置成本地断言。TRIGGER: 用户说「发布这个技能」「上架 skill」「更新到 skillhub」「推到 open.workbuddy」「同步到 GitHub」「技能发布报解析失败」「目录层级超限」「不允许的文件类型」「slug 已被封禁」「slug 冲突」「图标不让传」，或给出技能目录要求分发。DO NOT TRIGGER: 只是新建技能骨架（属于 skill-scaffold）；只是查找/安装别人的技能；只是普通代码提交。"
 description_zh: 把技能一次分发到三个平台：GitHub 仓库、SkillHub 市场、open.workbuddy。同一份内容派生三种形态，平台要的字段（slug / displayName / author）自动投影到临时副本而不污染源文件；发布前跑规则引擎，把「无扩展名文件」「根目录图标」「目录层级超限」「slug 被封禁」这类真实被拒过的坑拦在本地。SkillHub 支持 API Key 与会话 Cookie 两条凭据通道。默认演练，加 --yes 才真发。
 description_en: "Release a skill to three platforms in one command: a GitHub repo, the SkillHub marketplace, and open.workbuddy. One source of content, three packaging shapes; platform-specific frontmatter (slug / displayName / author) is projected into a staging copy instead of polluting the source. A rule engine blocks locally the exact failures platforms rejected before — extensionless files, root-level icons, over-deep paths, banned slugs. SkillHub accepts either an API key or a browser session cookie. Dry-run by default; --yes to actually publish."
-version: 1.4.4
+version: 1.4.5
 allowed-tools: Bash, Read, Write, Glob, Grep, AskUserQuestion
 category: 开发编程
 license: MIT
