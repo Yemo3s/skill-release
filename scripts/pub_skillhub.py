@@ -40,7 +40,7 @@ from pathlib import Path
 
 import rules
 
-__all__ = ["SkillHubError", "DEFAULT_HOST", "whoami", "publish",
+__all__ = ["SkillHubError", "DEFAULT_HOST", "whoami", "publish", "upload_icon",
            "collect_files", "validate"]
 
 DEFAULT_HOST = "https://api.skillhub.cn"
@@ -173,7 +173,13 @@ def _multipart(meta: dict, files: list[tuple[str, bytes]],
         "license": meta.get("license", ""),
         "homepage": meta.get("homepage", ""),
         "changelog": changelog,
+        # 官网表单直传 iconUrl（2026-10-12 从 skillhub 前端 bundle 反解确认：
+        # publish payload 支持 iconUrl 字段，值为 skill-icons/upload 返回的 COS URL）
+        "iconUrl": meta.get("iconUrl") or None,
     }
+    # iconUrl 为空时从 payload 里去掉（官网发的是 undefined），其余字段保持原样
+    if payload["iconUrl"] is None:
+        payload.pop("iconUrl")
     buf = bytearray()
 
     def part(name: str, data: bytes, filename: str | None = None,
@@ -194,6 +200,42 @@ def _multipart(meta: dict, files: list[tuple[str, bytes]],
         part("files", data, filename=rel, ctype=ctype)
     buf.extend(f"--{boundary}--\r\n".encode())
     return bytes(buf), boundary
+
+
+def upload_icon(host: str, token: str, icon_path: Path, cookie: str = "") -> str:
+    """上传技能图标 → 返回 iconUrl（COS 地址）。
+
+    契约（2026-10-12 从 skillhub.cn 前端 bundle 反解，函数名原样保留）：
+      `uploadSkillIcon(file)` = `new FormData` + `append("file", file, name)`
+      → `POST /api/v1/community/skill-icons/upload` → `{iconUrl}`。
+    平台要求 512×512 PNG（前端 validateAvatarFile/crop 到方形）；官方 CLI
+    不传图标 —— 图标只能走这条通道，或在 publish payload 里带 iconUrl。
+    """
+    icon_path = Path(icon_path)
+    data = icon_path.read_bytes()
+    if len(data) > 500_000:
+        raise SkillHubError(f"图标超过 500 KB（当前 {len(data) / 1024:.0f} KB）：{icon_path}")
+    boundary = "----skillrelease-icon" + str(int(time.time() * 1000))
+    buf = bytearray()
+    buf.extend(f"--{boundary}\r\n".encode())
+    buf.extend(b'Content-Disposition: form-data; name="file"; filename="'
+               + icon_path.name.encode("utf-8") + b'"\r\n')
+    buf.extend(b"Content-Type: image/png\r\n\r\n")
+    buf.extend(data)
+    buf.extend(f"\r\n--{boundary}--\r\n".encode())
+    status, body, _ = _request(
+        f"{host.rstrip('/')}/api/v1/community/skill-icons/upload",
+        token=token, cookie=cookie, data=bytes(buf), method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    if status not in (200, 201):
+        if status == 401:
+            raise SkillHubError("图标上传失败（401）：凭据失效，重新配 skillhub.cookie/key")
+        raise SkillHubError(f"图标上传失败（{status}）：{_brief(body)}")
+    url = str(body.get("iconUrl") or (body.get("data") or {}).get("iconUrl") or "")
+    if not url:
+        raise SkillHubError(f"图标上传未返回 iconUrl：{_brief(body)}")
+    return url
 
 
 def format_error(status: int, body: dict) -> str:

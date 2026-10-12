@@ -38,11 +38,14 @@ import urllib.request
 from pathlib import Path
 
 __all__ = ["WorkBuddyError", "DEFAULT_BASE", "whoami", "probe", "upload_and_submit",
-           "CAPABILITIES", "sniff_cookie", "cookie_from_har", "find_asset", "unwrap",
-           "set_user_agent", "user_agent"]
+           "upload_cover", "CAPABILITIES", "PRESIGN", "SCENE_COVER", "sniff_cookie",
+           "cookie_from_har", "find_asset", "unwrap", "set_user_agent", "user_agent"]
 
 DEFAULT_BASE = "https://open.workbuddy.cn"
 CAPABILITIES = "/api/v2/open-platform/capabilities"
+PRESIGN = "/api/v2/open-platform/common/uploads/presign"
+# 前端 imageType 枚举（chunk 79908）：头像/封面/证件照共用 presign 通道，靠 scene 区分
+SCENE_COVER = "capability_cover"
 
 # 曾经这里有一份 DEFAULT_PAYLOADS（字段名靠命名惯例猜：fileName/fileSize/
 # cosKey/assetId…），配一条 `/common/uploads/presign` 的「预签名」路径。
@@ -471,6 +474,76 @@ def find_asset(base: str, cookie: str, name: str, party_id: str = "",
     return None
 
 
+def _png_size(png_path: Path) -> tuple[int, int]:
+    """读 PNG IHDR 拿宽高。坏文件/非 PNG 抛 WorkBuddyError。"""
+    try:
+        head = Path(png_path).read_bytes()[:33]
+    except OSError as exc:
+        raise WorkBuddyError(f"读不了封面文件：{exc}") from exc
+    if head[:8] != b"\x89PNG\r\n\x1a\n":
+        raise WorkBuddyError(f"封面不是 PNG：{png_path}")
+    import struct
+    return struct.unpack(">II", head[16:24])
+
+
+def upload_cover(base: str, cookie: str, png_path: Path, *,
+                 party_id: str = "", enterprise_id: str = "",
+                 scene: str = SCENE_COVER) -> dict:
+    """上传封面/图标 → 返回 {'object_key','preview_url'}。
+
+    **这条与能力包上传是两条通道**（upload_and_submit 的坑 1 说 presign
+    不能传包 —— 反过来，封面恰好只能走 presign）。契约 2026-10-12 从前端
+    bundle 反解（chunk 48663 / tf controller + skill-icons 场景枚举）：
+
+      1. POST /api/v2/open-platform/common/uploads/presign
+         {scene:"capability_cover", fileName, fileSize, mimeType}
+         → data.{uploadUrl, objectKey, previewUrl}
+      2. PUT <uploadUrl>  body=图片字节  Content-Type: image/png   → 204/200
+
+    presign 通道**没有 complete 步骤**（前端 prepareUpload → uploadToCos
+    直接返回 objectKey）。objectKey 填进 submit/update 的
+    fields.common.coverObjectKey 即可。
+
+    平台硬约束（前端 CapabilityCover 规则，违反会被前端拦，这里前置同款断言）：
+    512×512 正方形 PNG、≤ 512000 字节。
+    """
+    png_path = Path(png_path)
+    if not png_path.is_file():
+        raise WorkBuddyError(f"封面文件不存在：{png_path}")
+    size = png_path.stat().st_size
+    w, h = _png_size(png_path)
+    if (w, h) != (512, 512):
+        raise WorkBuddyError(f"封面必须 512×512（当前 {w}×{h}）：{png_path}")
+    if size > 512_000:
+        raise WorkBuddyError(f"封面超过 512 KB（当前 {size / 1024:.0f} KB）：{png_path}")
+
+    status, body = _call(base, PRESIGN, cookie, method="POST",
+                         payload={"scene": scene, "fileName": png_path.name,
+                                  "fileSize": size, "mimeType": "image/png"},
+                         party_id=party_id, enterprise_id=enterprise_id)
+    if status != 200:
+        _auth_or_raise(status, body)
+        raise WorkBuddyError(f"封面 presign 失败（{status}）：{_brief(body)}")
+    data = unwrap(body)
+    upload_url = str(data.get("uploadUrl") or "")
+    object_key = str(data.get("objectKey") or "")
+    if not upload_url or not object_key:
+        raise WorkBuddyError(f"封面 presign 未返回 uploadUrl/objectKey：{_brief(body)}")
+
+    req = urllib.request.Request(
+        upload_url, data=png_path.read_bytes(), method="PUT",
+        headers={"Content-Type": "image/png", "User-Agent": _UA})
+    try:
+        with urllib.request.urlopen(req, timeout=120, context=_ctx()) as resp:
+            if resp.getcode() not in (200, 201, 204):
+                raise WorkBuddyError(f"封面直传 COS 失败：HTTP {resp.getcode()}")
+    except urllib.error.HTTPError as exc:
+        raise WorkBuddyError(f"封面直传 COS 失败：HTTP {exc.code}") from exc
+
+    return {"object_key": object_key,
+            "preview_url": str(data.get("previewUrl") or data.get("url") or "")}
+
+
 def upload_and_submit(base: str, cookie: str, zip_path: Path, *,
                      capability_type: str = "skill",
                      party_id: str = "", enterprise_id: str = "",
@@ -489,8 +562,9 @@ def upload_and_submit(base: str, cookie: str, zip_path: Path, *,
     | 4 | `POST /capabilities/submit` `{capabilityType,action,assetId,uploadToken,clientToken,fields}` | `data.{assetId,versionId,status}` |
 
     三个曾经踩过的坑，别再犯：
-    1. **别用 `/common/uploads/presign`** —— 那是头像/封面的通用上传，要 `scene` 字段，
-       拿它传能力包只会得到 `invalid request parameters`。
+    1. **别用 `/common/uploads/presign` 传能力包** —— 那是头像/封面的通道
+       （要 `scene` 字段），拿它传包只会得到 `invalid request parameters`。
+       反过来，封面/图标**只能**走它 —— 见 `upload_cover()`。
     2. **响应要剥 `data`**（见 `unwrap()`）。
     3. **`displayName` / `description` 不在 submit 里** —— 平台开包解析 SKILL.md
        的 frontmatter 自己取；`fields.common` 只需 categories / coverObjectKey / releaseNote。

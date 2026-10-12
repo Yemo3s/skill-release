@@ -31,7 +31,7 @@ import frontmatter as fm_mod      # noqa: E402
 import pack                       # noqa: E402
 import rules                      # noqa: E402
 
-__version__ = "1.4.3"
+__version__ = "1.4.4"
 
 DEFAULT_WORKDIR = Path.home() / ".workbuddy" / ".release"
 VERSION_FILE = "VERSION.txt"
@@ -244,6 +244,17 @@ def do_skillhub(skill: dict, staging: Path, cfg: dict, changelog: str,
     if not (key or cookie):
         return {"target": "skillhub", "ok": False, "status": "skipped",
                 "message": "未配置 skillhub.key 或 skillhub.cookie，跳过 SkillHub"}
+    # 图标：技能根目录 icon.png → skill-icons/upload → publish payload.iconUrl。
+    # SkillHub 的 iconUrl **只能**在 publish 时带上（官网表单同一字段），
+    # 漏了就会像 skill-release v1.4.3 那样在详情页裸奔。
+    if realize:
+        icon = skill["dir"] / "icon.png"
+        if icon.is_file():
+            try:
+                meta["iconUrl"] = sh.upload_icon(host, key, icon, cookie=cookie)
+            except sh.SkillHubError as exc:
+                return {"target": "skillhub", "ok": False, "status": "error",
+                        "message": f"图标上传失败（不影响包本身）：{exc}"}
     try:
         res = sh.publish(host, key, staging, meta, changelog or "版本更新",
                          dry_run=not realize, cookie=cookie)
@@ -287,10 +298,19 @@ def do_workbuddy(skill: dict, staging: Path, cfg: dict, changelog: str,
                            f"但未配置 workbuddy.cookie，跳过上传"}
 
     try:
+        # 封面：技能根目录 icon.png → presign(scene=capability_cover) → objectKey。
+        # 显式配置 cover_object_key 优先（老配置不破坏），否则自动上传。
+        cover_key = str(sec.get("cover_object_key") or "")
+        icon = skill["dir"] / "icon.png"
+        if realize and not cover_key and icon.is_file():
+            cover = wb.upload_cover(base, cookie, icon,
+                                    party_id=str(sec.get("party_id") or ""),
+                                    enterprise_id=str(sec.get("enterprise_id") or ""))
+            cover_key = cover["object_key"]
         res = wb.upload_and_submit(
             base, cookie, zip_path,
             name=slug,
-            cover_object_key=str(sec.get("cover_object_key") or ""),
+            cover_object_key=cover_key,
             categories=sec.get("categories") or None,
             party_id=str(sec.get("party_id") or ""),
             enterprise_id=str(sec.get("enterprise_id") or ""),

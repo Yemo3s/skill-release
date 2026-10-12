@@ -81,7 +81,7 @@ tags / license / homepage / changelog`。
 | **无扩展名文件一律拒绝** | verified | 真实报错：`不允许的文件类型: LICENSE` |
 | **根目录 `icon.*` 不能当内容文件传** | verified | 真实报错：`不允许的文件类型: icon.png` |
 | 包体积 ≤ 10 MB | verified | 官方 CLI 源码注释：publish 接口 10MB 限制 |
-| 图标 PNG 512×512 且 < 500 KB | verified | 上架门槛；**CLI 不传头像**，需发布后在详情页设 `iconUrl` |
+| 图标 PNG 512×512 且 < 500 KB | verified | 上架门槛；官方 CLI 不传头像，图标走**专用通道**（见下） |
 
 ### slug 可能被封禁（比「被占用」更麻烦）
 
@@ -121,9 +121,20 @@ tags / license / homepage / changelog`。
 400 {"error":"不允许的文件类型: icon.png"}
 ```
 
-所以本技能对 SkillHub **剔除根目录下的 `icon.*`**，并在发布后用详情页设
-`iconUrl`。注意判定用的是**过滤后**的清单 —— 否则 icon.png 会被天天报成
-「未验证扩展名」，把真信号淹掉。
+所以本技能对 SkillHub **剔除根目录下的 `icon.*`**（不当内容文件传），
+但图标本身有**专用上传通道**，v1.4.4 起发布时自动走：
+
+```
+POST /api/v1/community/skill-icons/upload    multipart，字段名 file
+  → 200 {"iconUrl": "https://skillhub-….cos.accelerate.myqcloud.com/skill-icons/uploads/<uid>/<hash>.png"}
+```
+
+出处：skillhub.cn 前端 bundle（`uploadSkillIcon(file)`，2026-10-12 反解）。
+拿到 iconUrl 后**随 publish payload 一起发**（payload 支持 `iconUrl` 字段，
+官网表单同一来源）—— 已实测 v1.4.4 发布成功（skillId 277816）。
+两个实测事实：① 官方 CLI 从不传 iconUrl，所以 CLI 发的技能全部无图标；
+② **已上架技能补图标的唯一办法是再 publish 一版**（列表/详情接口均无
+单独更新图标的端点），iconUrl 随版本审核异步生效，审核中列表仍显示 NULL。
 
 > 早先的文档把 `.png` 列进了「已验证」名单，那是从「官方 CLI 上传成功」
 > 反推的，而 CLI 本身就不传图标 —— 属于拿一个不含该类型的成功案例去证明
@@ -193,6 +204,23 @@ POST /api/v2/open-platform/capabilities/summary
 POST /api/v2/open-platform/capabilities/list
 ```
 
+**封面/图标通道**（与能力包完全分开，2026-10-12 从前端 bundle 反解）：
+
+```
+POST /api/v2/open-platform/common/uploads/presign
+     {"scene":"capability_cover","fileName":"icon.png","fileSize":N,"mimeType":"image/png"}
+  → data.{uploadUrl, objectKey, previewUrl}
+PUT  <uploadUrl>   body=PNG 字节，Content-Type: image/png
+  → objectKey 填进 submit / update 的 fields.common.coverObjectKey
+```
+
+要点：① `scene` 来自前端 imageType 枚举（chunk 79908，另有 avatar /
+buddy_app_icon 等）；② **没有 complete 步骤**，PUT 成功即生效；
+③ 平台硬约束 512×512 正方形、≤ 512000 字节（前端 CapabilityCover 规则）；
+④ 资产已存在时可走 `POST /capabilities/{assetId}/update` 补字段
+（controller 里与 delist/withdraw/publish 并列），body 结构按 submit 的
+fields 推断，**未实测** —— 别在审核中的资产上赌它。
+
 ### 硬性规则
 
 | 规则 | 等级 | 出处 |
@@ -209,16 +237,10 @@ POST /api/v2/open-platform/capabilities/list
 
 ### 待现场确认的部分
 
-第 1 / 3 / 4 / 5 步的**请求体字段名**由页面组件拼装，而组件在登录后才加载的
-路由分块里，未登录抓不到。因此这三个 body 做成可覆盖配置
-（`workbuddy.payloads` 段），首跑用 `probe` + 一次真实调用校准，
-把服务端返回的字段校验错误回填即可，**不需要改代码**。
-见 [troubleshooting.md](./troubleshooting.md) 的「现场校准」。
-
-**当前状态：卡在前置条件上** —— 手上这份 Cookie 经实测属于别的域名
-（302 → Keycloak 登录页），所以第 1 步还没真正跑到。校准必须在
-「`probe` 四个端点全是 200 JSON」之后做，否则字段名会被登录页的
-HTML 带偏。
+第 1 / 3 / 4 / 5 步的请求体字段名**已于 2026-10-10 全部实测确认**
+（见 `upload_and_submit()` docstring），`payloads` 覆盖配置保留但已不需要。
+「校准必须在 probe 全 200 之后做」这条纪律仍然有效 —— 会话失效时拿到的
+是登录页 HTML，照着它回填字段只会全错。
 
 ---
 
