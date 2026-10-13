@@ -230,11 +230,29 @@ commit 元数据里的姓名 / 邮箱写进去几乎删不掉（`force push` 只
 **图标（icon.png）自动上传**：技能根目录放一张 512×512、<500 KB 的 PNG 即可，
 发布时自动走各自的图标通道 ——
 SkillHub：`POST /api/v1/community/skill-icons/upload`（multipart，字段 `file`）
-→ `{iconUrl}` → publish payload 直带 `iconUrl`（**图标只能随 publish 更新**，
-漏了详情页就一直裸奔）；open.workbuddy：
+→ `{iconUrl}` → publish payload 直带 `iconUrl`（**补图标只能再 publish 一版**，
+平台没有单独改图的端点）；open.workbuddy：
 `POST /api/v2/open-platform/common/uploads/presign`（`scene: "capability_cover"`，
 **无 complete 步骤**）→ objectKey → `fields.common.coverObjectKey`。
-GitHub 不消费图标。两张图都不合规会在发布时报错（尺寸/大小前置断言）。
+GitHub 不消费图标。图不合规会在发布时报错（尺寸/大小前置断言）。
+
+> 核验图标是否**真的**生效：把远端图下载下来比 md5（两端同理）。
+> open.workbuddy 侧 `coverUrl` 为字面量 **`letter:auto`** 就等于**没有封面**；
+> 前台「看着还是旧图」多半是浏览器/CDN 缓存，别据此判定没传上。
+
+**资质类目必填**（open.workbuddy）：`fields.common.categories` 为空会被**审核驳回**
+（原文「无资质类目字段，需重新选择对应类目」）。它与 `marketCategories` 是**两套体系**，
+都要在凭据文件里配：
+
+```jsonc
+"categories": ["tools:office"],             // 资质类目：<大类>:<三级类目>
+"market_categories": ["development-tools"]  // 市场展示类目：连字符 id
+```
+
+枚举在**文档站**（`/docs/service-categories-individual`，个人主体），不在 API 里
+—— `GET /capabilities/categories` 给的是市场类目。个人主体「工具」大类下有
+办公 / 图片处理 / 计算器 / 信息查询 … 但**没有「开发工具」**，技术类技能一般填
+`tools:office`。为空时**本地直接报错**，不会白跑一次提交。
 
 细节与出处见 [references/platforms.md](./references/platforms.md)。
 

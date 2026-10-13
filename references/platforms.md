@@ -134,7 +134,13 @@ POST /api/v1/community/skill-icons/upload    multipart，字段名 file
 官网表单同一来源）—— 已实测 v1.4.4 发布成功（skillId 277816）。
 两个实测事实：① 官方 CLI 从不传 iconUrl，所以 CLI 发的技能全部无图标；
 ② **已上架技能补图标的唯一办法是再 publish 一版**（列表/详情接口均无
-单独更新图标的端点），iconUrl 随版本审核异步生效，审核中列表仍显示 NULL。
+单独更新图标的端点）。
+
+> ⚠️ 2026-10-12 复核实测修正：**「审核中列表仍显示 NULL」并不成立** ——
+> v1.4.5 提交后，公开接口 `GET /api/v1/users/<handle>/skills` 的 `iconUrl`
+> **立即**就是新图 URL（md5 与本地一致），且审核通过后 `iconAuditStatus`
+> 字段直接消失。所以「前台看着还是旧图」**基本是浏览器/CDN 缓存**，
+> 不要据此判定「没传上」—— **判据是下载远端图比 md5**，不是看接口有没有 URL。
 
 > 早先的文档把 `.png` 列进了「已验证」名单，那是从「官方 CLI 上传成功」
 > 反推的，而 CLI 本身就不传图标 —— 属于拿一个不含该类型的成功案例去证明
@@ -179,21 +185,28 @@ GET /api/v2/open-platform/parties
 2. **Cookie 必须是 `open.workbuddy.cn` 自己的**。Cookie 名确实叫 `session`，
    格式是 `<随机>|<过期时间戳>|<HMAC>`；但 `cloud.tencent.com` /
    `console.cloud.tencent.com` 用的是同名同格式的 `session`，域名不同，
-   **拿过来不认**。这两个站的 `qcloud_visitId` / `qcloud_from` / `trafficParams` /
-   `sensorsdata2015jssdkcross` 出现在 Cookie 里，基本可以判定拿错了站。
-3. **服务端会主动作废可疑会话**：带一个验证不过的 `session` 请求，响应里会
-   `Set-Cookie: session=<新值>` 并 `Set-Cookie: session_2=; Max-Age=0`。
-   所以看到 `session_2` 被清掉，等于服务端说「这份会话我不认」。
+   **拿过来不认**。
+   ⚠️ 但**别用「Cookie 里有没有 `qcloud_visitId` / `sensorsdata2015jssdkcross` /
+   `session_2`」来判断拿错站** —— 这些是**同源埋点**，出现在本站请求里完全正常
+   （实测有效会话里就有）。唯一可信判据是**请求能否过鉴权**：`probe` 四端点
+   全 `200 且 JSON` 才算通。
+3. **会话约两天过期**：过期后请求 302 到 Keycloak，此时重新导 HAR 走
+   `creds --from-har` 续期即可，不必怀疑 Cookie 结构有问题。
 
-上传链路 —— 能力（capabilities）是总称，技能是其中一类：
+上传链路 —— 能力（capabilities）是总称，技能是其中一类。
+**2026-10-10 从前端 bundle 反解 + 真机实测确认的真实契约**：
 
 | 步骤 | 端点 | 说明 |
 |---|---|---|
-| 1 | `POST /api/v2/open-platform/common/uploads/presign` | 取预签名地址 |
-| 2 | `PUT  {uploadUrl}` | 直传对象存储，`Content-Type` 用 zip 的 mime |
-| 3 | `POST /api/v2/open-platform/capabilities/init-upload` | 建资产，返回 `assetId` |
-| 4 | `POST /api/v2/open-platform/capabilities/complete-upload` | 完成 |
-| 5 | `POST /api/v2/open-platform/capabilities/submit` | **进审核队列** |
+| 1 | `POST …/capabilities/init-upload` | `{capabilityType,fileName,fileSize,mimeType}` → `data.{uploadId,objectKey,uploadUrl,expireAt}` |
+| 2 | `PUT  {uploadUrl}` | 直传 COS，`Content-Type` **必带**（少了签名不匹配） |
+| 3 | `POST …/capabilities/complete-upload` | `{uploadId, assetId?}` → `data.{uploadToken,…}` |
+| 4 | `POST …/capabilities/submit` | `{capabilityType,action,assetId,uploadToken,clientToken,fields}` → 进审核 |
+
+> ⚠️ 早前文档把第 1 步写成「`/common/uploads/presign` 取预签名」—— **这是错的**：
+> presign 是**封面/头像**的通道（要 `scene` 字段），拿它传能力包只会得到
+> `invalid request parameters`。反过来，封面**只能**走 presign，见下节。
+> 另：响应统一是 `{code,data,msg}` 信封，**必须剥 `data`**，否则取不到 `uploadUrl`。
 
 只读端点（`probe` 命令用的就是这几个）：
 
@@ -220,6 +233,41 @@ buddy_app_icon 等）；② **没有 complete 步骤**，PUT 成功即生效；
 ④ 资产已存在时可走 `POST /capabilities/{assetId}/update` 补字段
 （controller 里与 delist/withdraw/publish 并列），body 结构按 submit 的
 fields 推断，**未实测** —— 别在审核中的资产上赌它。
+⑤ **没有真封面时，列表接口的 `coverUrl` 返回字面量 `letter:auto`**
+（平台用它生成占位字母图）—— 这才是「没有封面」的判据，
+不是「URL 还没刷新」。2026-10-12 实测 `upload_cover()` 一次跑通，
+`coverUrl` 随即变成 `public/common/capability_cover/<uid>/<uuid>.png`。
+⑥ 两端的图标是否**真的生效**，唯一可靠判据是**把远端图下载下来比 md5**，
+不要只看接口有没有返回 URL。
+
+**类目（两套体系，`submit` 时都要给）** —— 2026-10-13 实测（被驳回一次换来的）：
+
+| 字段 | 体系 | 取值 | 空着会怎样 |
+|---|---|---|---|
+| `fields.common.categories` | **资质类目** | `[{"categoryId":"tools:office","qualifications":[]}]` | **审核驳回**：「无资质类目字段，需重新选择对应类目，如需资质请一并提交」 |
+| `fields.common.marketCategories` | 市场展示类目 | `["development-tools"]`（连字符 id） | 前台分类缺失 |
+
+- 资质类目的**枚举在文档站，不在 API 里**：`GET /capabilities/categories`
+  返回的是**市场类目**（13 个连字符 id），资质类目要到
+  `https://open.workbuddy.cn/docs/service-categories-individual`（个人主体）
+  或 `…/docs/service-categories-enterprise`（非个人主体）翻。
+- 个人主体「**工具**」大类下的三级类目（左列均为 `/`，**不要求资质**）：
+  记账 / 日历 / 天气 / **办公** / **图片处理** / 计算器 / 报价·比价 /
+  信息查询 / 预约·报名 / 健康管理 / 备忘录 —— **没有「开发工具」**，
+  所以技术类技能一般落 `tools:office`。
+- 已确认的 id 映射：办公 → `tools:office`；图片处理 → `tools:image_editing`。
+- 配置写法（凭据文件 `workbuddy` 段）：`"categories": ["tools:office"]`
+  （纯字符串会自动包装成平台要的 `{categoryId, qualifications}` 结构）、
+  `"market_categories": ["development-tools"]`。
+  代码侧见 `pub_workbuddy.normalize_categories()`；**空类目会在本地直接抛错**，
+  不会等平台驳回。
+- 想抄填法：`GET /capabilities/{assetId}` 的 `data.fields.common`
+  能看到已过审资产的真实写法。
+
+> 两个易误判点：① `GET /capabilities/categories` 的 13 个是**市场类目**，
+> 不是资质类目，拿它填 `categories` 过不了审；② 提交后要看
+> `pendingVersion.version` 才同步成包里的版本号，draft/rejected 阶段
+> 详情里显示的是旧版本号（别误会成「包没生效」）。
 
 ### 硬性规则
 

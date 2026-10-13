@@ -312,6 +312,7 @@ def do_workbuddy(skill: dict, staging: Path, cfg: dict, changelog: str,
             name=slug,
             cover_object_key=cover_key,
             categories=sec.get("categories") or None,
+            market_categories=sec.get("market_categories") or None,
             party_id=str(sec.get("party_id") or ""),
             enterprise_id=str(sec.get("enterprise_id") or ""),
             changelog=changelog, submit=submit, dry_run=not realize)
@@ -334,6 +335,20 @@ def cmd_check(args) -> int:
     slugs = resolve_slugs(skill, cfg, getattr(args, "slug", "") or "")
     inv, findings = rules.analyze(skill["dir"], skill["fm"], targets, author,
                                   slugs["skillhub"])
+    # open.workbuddy 的**资质类目**为空 = 提交后必被审核驳回
+    #（「无资质类目字段，需重新选择对应类目」，2026-10-13 实测踩过）。
+    # 这里前置成 warn（不阻断：本次可能压根不发 workbuddy）。
+    if "workbuddy" in targets:
+        sec = cfg.get("workbuddy", {}) or {}
+        if not [c for c in (sec.get("categories") or []) if c]:
+            findings.append(rules.Finding(
+                "warn", "workbuddy", "no-category",
+                "未配置 workbuddy.categories（资质类目），提交后会因「无资质类目字段」被驳回",
+                "verified",
+                "个人主体可选值见 https://open.workbuddy.cn/docs/service-categories-individual"
+                "；技术类技能一般填 [\"tools:office\"]（工具-办公）；"
+                "同时建议配 market_categories（如 [\"development-tools\"]）",
+            ))
     if want_json(args):
         print(json.dumps({
             "skill": skill["slug"], "version": skill["version"], "dir": str(skill["dir"]),

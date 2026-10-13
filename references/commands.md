@@ -111,6 +111,19 @@ $PY "$SR" creds --from-har ~/Downloads/wb.har # ★ open.workbuddy 用这个，�
 | `workbuddy.cookie` | `WORKBUDDY_COOKIE` |
 | `author` | `SKILL_RELEASE_AUTHOR` |
 
+`workbuddy` 段除 `cookie` 外，还有几个**发布必需**的字段：
+
+| 字段 | 说明 |
+|---|---|
+| `party_id` | 入驻主体 ID（如 `psn_…`），对应 `X-Party-Id` 请求头 |
+| `user_agent` | **签发会话那个浏览器的逐字符 UA**；`creds --from-har` 会自动一并抽取 |
+| `categories` | **资质类目**，如 `["tools:office"]`。**为空会被审核驳回**（「无资质类目字段」） |
+| `market_categories` | 市场展示类目，如 `["development-tools"]`（前台分类用） |
+| `cover_object_key` | 可选；留空则自动上传技能根目录的 `icon.png`（512×512、<500 KB） |
+
+`categories` 的枚举在<https://open.workbuddy.cn/docs/service-categories-individual>
+（个人主体）—— 注意 `GET /capabilities/categories` 给的是**市场类目**，不是资质类目。
+
 ### 怎么取 SkillHub 的凭据（二选一）
 
 **A. 会话 Cookie**（不用去签发 Key）

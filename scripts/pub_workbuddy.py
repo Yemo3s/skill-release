@@ -9,24 +9,25 @@
     额外头        X-Party-Id（入驻主体）、X-Enterprise-Id（企业），没有可省
     401 语义      会话过期 → 前端跳登录
 
-    上传链路（能力 = capabilities，技能是其中一类）：
-      1. POST /api/v2/open-platform/common/uploads/presign     → {uploadUrl, ...}
-      2. PUT  {uploadUrl}  body=zip  Content-Type=<mime>       → 直传 COS
-      3. POST /api/v2/open-platform/capabilities/init-upload
-      4. POST /api/v2/open-platform/capabilities/complete-upload
-      5. POST /api/v2/open-platform/capabilities/submit        → 进审核队列
+    上传链路（能力 = capabilities，技能是其中一类）—— 2026-10-10 真机实测：
+      1. POST /api/v2/open-platform/capabilities/init-upload    → {uploadId, uploadUrl, objectKey}
+      2. PUT  {uploadUrl}  body=zip  Content-Type=<mime>        → 直传 COS
+      3. POST /api/v2/open-platform/capabilities/complete-upload → {uploadToken}
+      4. POST /api/v2/open-platform/capabilities/submit         → 进审核队列
+
+    ⚠️ 别拿 `/common/uploads/presign` 传能力包 —— 那是封面/头像的通道（要 scene），
+    传包只会得到 `invalid request parameters`。反过来封面**只能**走它，见 upload_cover()。
 
     只读接口：
-      GET  /api/v2/open-platform/capabilities/categories?capabilityType=skill
+      GET  /api/v2/open-platform/parties
+      GET  /api/v2/open-platform/capabilities/categories?capabilityType=skill  （市场类目）
+      GET  /api/v2/open-platform/capabilities/{assetId}                        （详情，含 fields）
       POST /api/v2/open-platform/capabilities/summary
       POST /api/v2/open-platform/capabilities/list
 
-待现场确认（第 1/3/4/5 步的**请求体字段名**）：
-  这几步的 body 由页面组件拼装，而组件在登录后才加载的路由分块里，
-  未登录抓不到。因此 body 做成可覆盖配置：`workbuddy.payloads` 段。
-  首跑用 `probe` 打一次，把服务端返回的字段校验错误回填进来即可，
-  不需要改代码 —— 见 references/troubleshooting.md 的「现场校准」一节。
-"""
+    资质类目（`fields.common.categories`）的枚举在**文档站**，不在 API 里：
+      https://open.workbuddy.cn/docs/service-categories-individual
+    """
 
 from __future__ import annotations
 
@@ -38,8 +39,9 @@ import urllib.request
 from pathlib import Path
 
 __all__ = ["WorkBuddyError", "DEFAULT_BASE", "whoami", "probe", "upload_and_submit",
-           "upload_cover", "CAPABILITIES", "PRESIGN", "SCENE_COVER", "sniff_cookie",
-           "cookie_from_har", "find_asset", "unwrap", "set_user_agent", "user_agent"]
+           "upload_cover", "normalize_categories", "CAPABILITIES", "PRESIGN",
+           "SCENE_COVER", "sniff_cookie", "cookie_from_har", "find_asset", "unwrap",
+           "set_user_agent", "user_agent"]
 
 DEFAULT_BASE = "https://open.workbuddy.cn"
 CAPABILITIES = "/api/v2/open-platform/capabilities"
@@ -436,6 +438,7 @@ def code_of(body: dict) -> int | None:
 ASSET_UNDER_REVIEW = "under_review"
 ASSET_DRAFT = "draft"
 ASSET_PUBLISHED = "published"
+ASSET_REJECTED = "rejected"
 # 版本状态：同一个「审核中」在列表接口里叫 `pending`，在详情接口里叫 `under_review`，
 # 两个都得认 —— 只判一个的话「已在审核」会被漏掉，然后白传一遍包并撞上
 # 「版本号必须大于当前最新版本」（实测踩过）。
@@ -544,13 +547,53 @@ def upload_cover(base: str, cookie: str, png_path: Path, *,
             "preview_url": str(data.get("previewUrl") or data.get("url") or "")}
 
 
+def normalize_categories(cats: list | None) -> list[dict]:
+    """把类目配置规范成平台要的 `[{"categoryId":…,"qualifications":[…]}]`。
+
+    2026-10-13 实测确认的契约（从 open.workbuddy 详情接口
+    `GET /capabilities/{assetId}` 取已通过技能的 `fields.common` 反解）：
+
+      "categories":       [{"categoryId": "tools:office", "qualifications": []}]
+      "marketCategories": ["development-tools", "collaboration"]
+
+    两个字段是**两套体系**，都要填：
+
+    | 字段 | 体系 | 取值 |
+    |---|---|---|
+    | `categories` | 资质类目 | `<大类>:<三级类目>`，如 `tools:office`（工具-办公） |
+    | `marketCategories` | 市场展示类目 | 连字符 id，如 `development-tools` |
+
+    资质类目枚举见 `https://open.workbuddy.cn/docs/service-categories-individual`
+    （个人主体）。**「工具」大类下有**：记账 / 日历 / 天气 / 办公 /
+    图片处理 / 计算器 / 报价·比价 / 信息查询 / 预约·报名 / 健康管理 / 备忘录
+    —— 注意**没有「开发工具」**，所以技术类技能一般落 `tools:office`。
+
+    ⚠️ 只填 `marketCategories` 而 `categories` 为空会被审核驳回：
+    「无资质类目字段，需重新选择对应类目，如需资质请一并提交」。
+    别等平台驳回，本地就拦住 —— 见下面的前置断言。
+    """
+    out: list[dict] = []
+    for item in cats or []:
+        if isinstance(item, str):
+            cid = item.strip()
+            if cid:
+                out.append({"categoryId": cid, "qualifications": []})
+        elif isinstance(item, dict):
+            cid = str(item.get("categoryId") or item.get("id") or "").strip()
+            if cid:
+                quals = [q for q in (item.get("qualifications") or []) if q]
+                out.append({"categoryId": cid, "qualifications": quals})
+    return out
+
+
 def upload_and_submit(base: str, cookie: str, zip_path: Path, *,
                      capability_type: str = "skill",
                      party_id: str = "", enterprise_id: str = "",
                      changelog: str = "", submit: bool = True,
                      dry_run: bool = False, name: str = "",
                      cover_object_key: str = "",
-                     categories: list | None = None) -> dict:
+                     categories: list | None = None,
+                     market_categories: list | None = None) -> dict:
     """走完 init-upload → PUT COS → complete-upload →（可选）submit。
 
     **真实契约**（2026-10-10 从前端 bundle 反解 + 真机实测，替换掉此前靠猜的版本）：
@@ -567,7 +610,9 @@ def upload_and_submit(base: str, cookie: str, zip_path: Path, *,
        反过来，封面/图标**只能**走它 —— 见 `upload_cover()`。
     2. **响应要剥 `data`**（见 `unwrap()`）。
     3. **`displayName` / `description` 不在 submit 里** —— 平台开包解析 SKILL.md
-       的 frontmatter 自己取；`fields.common` 只需 categories / coverObjectKey / releaseNote。
+       的 frontmatter 自己取；`fields.common` 需要 categories（**资质类目，不可为空**）
+       / marketCategories（市场类目）/ coverObjectKey / releaseNote，
+       格式与取值见 `normalize_categories()`。
 
     `dry_run=True` 只校验本地文件与鉴权，不产生任何服务端副作用。
     """
@@ -647,16 +692,35 @@ def upload_and_submit(base: str, cookie: str, zip_path: Path, *,
     # 4) 提交审核 —— 只带 fields.common，名称/简介由平台解包 SKILL.md 得到
     import uuid
 
-    cats = categories or []
+    # 资质类目为空 = 必然被驳回（2026-10-13 实测踩过），本地先拦，别浪费一次提交
+    cats = normalize_categories(categories)
+    if not cats:
+        raise WorkBuddyError(
+            "open.workbuddy 要求至少一个**资质类目**（fields.common.categories），"
+            "为空会被审核驳回：「无资质类目字段，需重新选择对应类目」。\n"
+            "    请在凭据文件里配 workbuddy.categories，例如：\n"
+            '      "categories": ["tools:office"]\n'
+            "    个人主体可用枚举见 "
+            "https://open.workbuddy.cn/docs/service-categories-individual"
+        )
     fields = {"common": {
         "categories": cats,
+        "marketCategories": [str(x) for x in (market_categories or [])],
         "coverObjectKey": cover_object_key,
         "releaseNote": changelog,
     }}
+    # 驳回过的资产走 resubmit（「修改后重新提交」），其余更新走 republish。
+    # 三者都带 uploadToken —— action 只是告诉平台这次提交的性质。
+    if not asset_id:
+        action = ACTION_CREATE
+    elif str((asset or {}).get("status") or "") == ASSET_REJECTED:
+        action = ACTION_RESUBMIT
+    else:
+        action = ACTION_REPUBLISH
     status, body = _call(base, f"{CAPABILITIES}/submit", cookie, method="POST",
                          payload={
                              "capabilityType": capability_type,
-                             "action": ACTION_REPUBLISH if asset_id else ACTION_CREATE,
+                             "action": action,
                              "assetId": asset_id,
                              "uploadToken": upload_token,
                              "clientToken": f"pub_{uuid.uuid4()}",

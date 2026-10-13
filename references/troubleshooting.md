@@ -83,7 +83,9 @@ $PY "$SR" creds --set skillhub.cookie='skh_token=<JWT>; sid=<sid>'   # B：浏�
 所以正常不该再遇到。若仍出现，说明图标不在根目录 —— 子目录里的 png 不在
 排除范围内（那种情况属于未验证类型，`check` 会先给 warn）。
 
-发布后在 SkillHub 详情页手动设 `iconUrl` 即可（官方 CLI 同样不传头像）。
+图标本身有**专用上传通道**，`v1.4.4` 起发布时自动走
+`POST /api/v1/community/skill-icons/upload`（multipart 字段 `file`），
+把返回的 `iconUrl` 随 publish payload 一起发 —— **无需再到详情页手动设置**。
 
 ### `slug 冲突（409）` / `slug 已被封禁`
 
@@ -287,6 +289,49 @@ $PY "$SR" creds --set workbuddy.cookie='<新 Cookie>'
 资产已经在服务端了。报错里会带 `assetId`，可以：
 (a) 控制台手工提交；(b) 校准 `payloads.submit` 后重跑。
 **不要盲目重跑整个流程** —— 会创建重复资产。
+
+### 审核驳回：`无资质类目字段，需重新选择对应类目`
+
+平台原话：「无资质类目字段，需重新选择对应类目，如需资质请一并提交，
+请修改后再重新提交审核」。根因是 `fields.common.categories`（**资质类目**）为空。
+
+三个容易踩错的地方：
+
+1. **资质类目 ≠ 市场类目**。`GET /capabilities/categories` 返回的 13 个
+   （`development-tools` 等）是**市场类目**，对应 `marketCategories`；
+   拿它去填 `categories` 过不了审。
+2. **资质类目的枚举不在 API 里**，在文档站：
+   - 个人主体 <https://open.workbuddy.cn/docs/service-categories-individual>
+   - 非个人主体 <https://open.workbuddy.cn/docs/service-categories-enterprise>
+
+   格式是 `<大类>:<三级类目>`。个人主体「**工具**」大类下有：记账 / 日历 /
+   天气 / **办公** / **图片处理** / 计算器 / 报价·比价 / 信息查询 /
+   预约·报名 / 健康管理 / 备忘录 —— **没有「开发工具」**，
+   所以技术类技能一般填 `tools:office`。
+3. **`tools:office` 不需要资质**（文档里资质要求列是 `/`），
+   `qualifications` 留空数组即可。
+
+```jsonc
+// 凭据文件 ~/.workbuddy/.secrets/skill-release.json 的 workbuddy 段
+"categories": ["tools:office"],            // 资质类目，字符串会自动包装
+"market_categories": ["development-tools"] // 市场展示类目
+```
+
+本技能的 `pub_workbuddy.normalize_categories()` 会把字符串包装成
+平台要的 `[{"categoryId":…,"qualifications":[]}]`；**类目为空时本地直接抛错**，
+不会再白跑一次提交。
+
+> 重新提交后：资产状态回到 `under_review`，**`versionId` 会换新**
+> （实测 45584 → 46965），并且只有到这一步
+> `pendingVersion.version` 才会同步成**包里的**版本号。
+
+重新提交：
+
+```bash
+$PY "$SR" publish <技能目录> --targets workbuddy --yes --changelog "补充资质类目"
+```
+
+（被驳回的资产不用新建，`find_asset` 会按 name 命中并按状态走 `resubmit`。）
 
 ---
 
