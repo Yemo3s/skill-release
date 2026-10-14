@@ -2,10 +2,10 @@
 name: skill-release
 display_name: 技能发布管家
 display_name_en: Skill Release Manager
-description: "把本地技能一句话发到 GitHub / SkillHub / open.workbuddy 三处，并把两个平台的校验规则前置成本地断言。TRIGGER: 用户说「发布这个技能」「上架 skill」「更新到 skillhub」「推到 open.workbuddy」「同步到 GitHub」「技能发布报解析失败」「目录层级超限」「不允许的文件类型」「slug 已被封禁」「slug 冲突」「图标不让传」，或给出技能目录要求分发。DO NOT TRIGGER: 只是新建技能骨架（属于 skill-scaffold）；只是查找/安装别人的技能；只是普通代码提交。"
+description: "把本地技能一句话发到 GitHub / SkillHub / open.workbuddy 三处，并把两个平台的校验规则前置成本地断言。TRIGGER: 用户说「发布这个技能」「上架 skill」「更新到 skillhub」「推到 open.workbuddy」「同步到 GitHub」「技能发布报解析失败」「目录层级超限」「不允许的文件类型」「slug 已被封禁」「slug 冲突」「图标不让传」「撤回待审版本」「改完再重新提交」，或给出技能目录要求分发。DO NOT TRIGGER: 只是新建技能骨架（属于 skill-scaffold）；只是查找/安装别人的技能；只是普通代码提交。"
 description_zh: 把技能一次分发到三个平台：GitHub 仓库、SkillHub 市场、open.workbuddy。同一份内容派生三种形态，平台要的字段（slug / displayName / author）自动投影到临时副本而不污染源文件；发布前跑规则引擎，把「无扩展名文件」「根目录图标」「目录层级超限」「slug 被封禁」这类真实被拒过的坑拦在本地。SkillHub 支持 API Key 与会话 Cookie 两条凭据通道。默认演练，加 --yes 才真发。
 description_en: "Release a skill to three platforms in one command: a GitHub repo, the SkillHub marketplace, and open.workbuddy. One source of content, three packaging shapes; platform-specific frontmatter (slug / displayName / author) is projected into a staging copy instead of polluting the source. A rule engine blocks locally the exact failures platforms rejected before — extensionless files, root-level icons, over-deep paths, banned slugs. SkillHub accepts either an API key or a browser session cookie. Dry-run by default; --yes to actually publish."
-version: 1.4.5
+version: 1.4.8
 allowed-tools: Bash, Read, Write, Glob, Grep, AskUserQuestion
 category: 开发编程
 license: MIT
@@ -146,6 +146,18 @@ $PY "$SR" probe
 别走剪贴板；只点「导出 HAR」不勾上面那个开关的话，导出的 HAR 里**一个 Cookie 都没有**。
 详见 [references/troubleshooting.md](./references/troubleshooting.md)。
 
+### 撤回 open.workbuddy 的待审版本
+
+```bash
+$PY "$SR" withdraw <技能目录>            # 按 frontmatter 的 slug/name 找资产
+$PY "$SR" withdraw os_841ab5b3d968503a   # 也可以直接给 assetId
+```
+
+把**正在审核**的版本退回 `draft`。`publish` 遇到资产在审核中会整体跳过，
+所以「提交后才发现字段填错」原本只能干等驳回 —— 用这条主动退回来，
+改完再 `publish`。**不改版本号**，重提可用同版本或更高版本。
+审核计时会重头开始，只改了工具代码这种权衡一下再决定。
+
 ### 审计提交身份（GitHub）
 
 ```bash
@@ -215,6 +227,14 @@ commit 元数据里的姓名 / 邮箱写进去几乎删不掉（`force push` 只
 并在 commit 后与 push 前各断言一次 —— 绝不回退到全局 git 身份
 （那通常是真名 + 公司邮箱）。详见 `references/troubleshooting.md`。
 
+**`git push` 走的域名是 `github.com`，REST API 走的是 `api.github.com`**
+—— 这两个域名的可达性可以完全不同（实测本机：`github.com` 直连超时、
+沙箱代理对 CONNECT 返回 502，而 `api.github.com` 一切正常）。
+所以推送失败时**先看报错类型**：属网络不通（`CONNECT tunnel failed` /
+`Failed to connect … port 443`）就自动改走 API 兜底——
+用 Git Data API 把同一棵树写成一次提交，身份同样显式写 noreply。
+认证类报错（403 / 令牌无效）不会触发兜底，换通道也是白换。
+
 **SkillHub 的 Cookie 通道只留必要字段**：浏览器整串 Cookie 里其它域名的项
 （如 `qcloud_*`、`sensorsdata*`）一律裁掉，只保留 `skh_token` 与 `sid`
 —— 少一个字段就少一处泄漏面（见 `references/platforms.md`）。
@@ -240,19 +260,22 @@ GitHub 不消费图标。图不合规会在发布时报错（尺寸/大小前置
 > open.workbuddy 侧 `coverUrl` 为字面量 **`letter:auto`** 就等于**没有封面**；
 > 前台「看着还是旧图」多半是浏览器/CDN 缓存，别据此判定没传上。
 
-**资质类目必填**（open.workbuddy）：`fields.common.categories` 为空会被**审核驳回**
-（原文「无资质类目字段，需重新选择对应类目」）。它与 `marketCategories` 是**两套体系**，
-都要在凭据文件里配：
+**服务（资质）类目必填**（open.workbuddy）：`fields.common.categories` 为空会被**审核驳回**
+（原文「服务类目审核：无资质类目字段，需重新选择对应类目」）。它与 `marketCategories`
+是**两套体系**，都要在凭据文件里配：
 
 ```jsonc
-"categories": ["tools:office"],             // 资质类目：<大类>:<三级类目>
+"categories": ["tools:office"],             // 服务类目：<大类>:<三级类目>
 "market_categories": ["development-tools"]  // 市场展示类目：连字符 id
 ```
 
-枚举在**文档站**（`/docs/service-categories-individual`，个人主体），不在 API 里
-—— `GET /capabilities/categories` 给的是市场类目。个人主体「工具」大类下有
-办公 / 图片处理 / 计算器 / 信息查询 … 但**没有「开发工具」**，技术类技能一般填
-`tools:office`。为空时**本地直接报错**，不会白跑一次提交。
+⚠️ **资质为空时不要下发 `qualifications` 这个键**（写成 `[]` 一样被打回，话术一模一样）。
+控制台就是「有资质文件才带键」，代码侧由 `normalize_categories()` 保证。
+枚举的唯一权威来源是 `GET /capabilities/business-categories`（**不是**文档站、
+更不是 `GET /capabilities/categories` 那 13 个市场类目）。个人主体「工具」大类下有
+办公 `tools:office` / 图片处理 `tools:image_editing` / 信息查询 … 但**没有「开发工具」**，
+技术类技能一般填 `tools:office`。为空时**本地直接报错**，不会白跑一次提交。
+驳回原因可直接查 `GET /capabilities/{assetId}/reasons`。
 
 细节与出处见 [references/platforms.md](./references/platforms.md)。
 

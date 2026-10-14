@@ -87,6 +87,51 @@ $PY "$SR" creds --set skillhub.cookie='skh_token=<JWT>; sid=<sid>'   # B：浏�
 `POST /api/v1/community/skill-icons/upload`（multipart 字段 `file`），
 把返回的 `iconUrl` 随 publish payload 一起发 —— **无需再到详情页手动设置**。
 
+### `不允许的文件类型: <某个你没见过的扩展名>`（如 `.tsv`）
+
+SkillHub 按**扩展名白名单**过滤，白名单外的类型**整包被拒**。
+已被实测拒过的扩展名记在 `rules.py` 的 `REJECTED_EXT`，命中即本地 block：
+
+| 扩展名 | 报错原文 | 出处 |
+|---|---|---|
+| `.tsv` | `400 {"error":"不允许的文件类型: reference/icon-map.tsv"}` | 2026-10-13 `probably-stolen` |
+
+改法：**同内容换个允许的扩展名**。制表符文本改名 `.txt` 即可通过
+（实测路径：`reference/icon-map.tsv` → `reference/icon-map.txt`），
+**记得同步代码与文档里的引用** —— 否则包里链接指向一个不存在的文件。
+
+> 顺带一提：`rules.py` 里 `VERIFIED_EXT`（验证可通过）与 `REJECTED_EXT`
+> （实测被拒）是两档不同的信号，别混。前者命中只 warn，后者命中 block。
+
+### `git push` 报 `CONNECT tunnel failed, response 502` / `Failed to connect to github.com port 443`
+
+这不是认证问题，是**网络到不了 `github.com`**。关键事实：
+
+| 域名 | 谁在用 | 可达性 |
+|---|---|---|
+| `github.com` | `git push/pull` | 实测本机：直连超时；代理对 CONNECT 返 502 |
+| `api.github.com` | REST API（建仓 / 审计 / 备份） | 同一时刻一切正常 |
+
+所以「API 能建仓、git 推不上去」是正常现象，不是配置错了。
+
+**本技能 v1.4.6 起自动兜底**：`push()` 失败且报错属网络类时，
+改调 `push_via_api()` —— 用 Git Data API 把同一棵树写成一次提交，
+身份同样显式写 noreply，产出与原 git 提交一致（消息/身份/日期相同则
+commit SHA 也相同，所以两条通道可互换、幂等）。
+
+判定与兜底都在 [scripts/pub_github.py](../scripts/pub_github.py)：
+`is_network_failure()` 认网络类报错，`push_via_api()` 走 API。
+403 / 令牌无效**不**触发兜底 —— 那种情况换通道一样失败。
+
+两个空仓库的坑（已在代码里处理）：
+
+1. Git Data API 的 `blobs` / `trees` / `commits` 在**还没有任何提交**的仓库上
+   一律 `409 Git Repository is empty`。要先用 Contents API 落一个文件 bootstrap。
+2. bootstrap 之后写一条**无父提交**（root commit）再 force 更新 ref，
+   分支上就只留一条提交，bootstrap 那条成为不可达对象 —— 干净。
+
+逃生舱：`ghx api <METHOD> <PATH> [--body …]` 可以直接打 REST，用于现场排查。
+
 ### `slug 冲突（409）` / `slug 已被封禁`
 
 先分清三种：
@@ -292,37 +337,71 @@ $PY "$SR" creds --set workbuddy.cookie='<新 Cookie>'
 
 ### 审核驳回：`无资质类目字段，需重新选择对应类目`
 
-平台原话：「无资质类目字段，需重新选择对应类目，如需资质请一并提交，
-请修改后再重新提交审核」。根因是 `fields.common.categories`（**资质类目**）为空。
+平台原话：「**服务类目审核：**无资质类目字段，需重新选择对应类目，如需资质请一并
+提交，请修改后再重新提交审核」。**2026-10-14 第二次驳回后才定位到真根因**，
+下面这版才是对的（前两版结论都错，别再按老思路查）。
 
-三个容易踩错的地方：
+**真根因：空 `qualifications` 数组。** 「服务类目没选」会被驳回没错，但
+**选了类目一样会被驳回** —— 只要把空资质写成
+`{"categoryId":"tools:office","qualifications":[]}`。审核侧会判成
+「选了类目却没交资质」，打回话术仍然是那句「无资质类目字段」。
+控制台提交前会跑一遍 `normalizeCategories()`：
 
-1. **资质类目 ≠ 市场类目**。`GET /capabilities/categories` 返回的 13 个
-   （`development-tools` 等）是**市场类目**，对应 `marketCategories`；
-   拿它去填 `categories` 过不了审。
-2. **资质类目的枚举不在 API 里**，在文档站：
-   - 个人主体 <https://open.workbuddy.cn/docs/service-categories-individual>
-   - 非个人主体 <https://open.workbuddy.cn/docs/service-categories-enterprise>
+```js
+let t = {categoryId: e.categoryId};
+a.length > 0 && (t.qualifications = a);   // 空资质 → 整个键都不发
+```
 
-   格式是 `<大类>:<三级类目>`。个人主体「**工具**」大类下有：记账 / 日历 /
-   天气 / **办公** / **图片处理** / 计算器 / 报价·比价 / 信息查询 /
-   预约·报名 / 健康管理 / 备忘录 —— **没有「开发工具」**，
-   所以技术类技能一般填 `tools:office`。
-3. **`tools:office` 不需要资质**（文档里资质要求列是 `/`），
-   `qualifications` 留空数组即可。
+所以 `tools:office` 这类 `qualificationRequired: false` 的类目，
+**必须一个 `qualifications` 键都不带**。
+
+> ⚠️ **判据盲区**：详情接口读回来永远是 `"qualifications": []`
+> （服务端把缺键归一化了），**看接口分别不出当初到底发没发那个键**。
+> 只能回代码看 `normalize_categories()`。
+
+排查顺序：
+
+1. **服务类目 ≠ 市场类目**，两套体系在 `submit` 时都要给：
+   `fields.common.categories`（服务/资质类目）与 `fields.common.marketCategories`
+   （市场展示类目，1..3 个）。
+2. **服务类目枚举的唯一权威来源是
+   `GET /api/v2/open-platform/capabilities/business-categories`**
+   （2026-10-14 从前端 chunk 反解，接口名 `capabilityPort.businessCategories()`）。
+   条目形如
+   `{"id":"tools:office","name":{"zh":"办公"},"qualificationRequired":false}`。
+   个人主体「工具」大类下 11 个三级类目：
+   记账 `tools:bookkeeping` / 日历 `tools:calendar` / 天气 `tools:weather` /
+   **办公 `tools:office`** / **图片处理 `tools:image_editing`** /
+   计算器 `tools:calculator` / 报价·比价 `tools:price_comparison` /
+   信息查询 `tools:info_lookup` / 预约·报名 `tools:booking` /
+   健康管理 `tools:health_management` / 备忘录 `tools:memo`
+   —— **没有「开发工具」**，所以技术类技能一般落 `tools:office`。
+3. **payload 与控制台逐字段对齐**：`{capabilityType, assetType, action,
+   assetId, uploadToken, clientToken, fields:{common:{…}}}` ——
+   `assetType` 与控制台一样要发（值同 `capabilityType`）。
 
 ```jsonc
 // 凭据文件 ~/.workbuddy/.secrets/skill-release.json 的 workbuddy 段
-"categories": ["tools:office"],            // 资质类目，字符串会自动包装
+"categories": ["tools:office"],            // 服务（资质）类目
 "market_categories": ["development-tools"] // 市场展示类目
 ```
 
-本技能的 `pub_workbuddy.normalize_categories()` 会把字符串包装成
-平台要的 `[{"categoryId":…,"qualifications":[]}]`；**类目为空时本地直接抛错**，
-不会再白跑一次提交。
+`pub_workbuddy.normalize_categories()` 负责包装成平台结构，
+并**丢掉空的 `qualifications`**；类目为空时本地直接抛错，不会白跑一次提交。
+
+**驳回原因怎么查**（不用等站内信）：
+
+```
+GET /capabilities/{assetId}/reasons
+  → data.{rejectStage: "manual"|"auto", reviewDetail:{reviewNote, reviewedAt}}
+GET /api/v2/open-platform/messages
+  → 平台通知全量流水（asset.approved / asset.rejected…）
+```
+
+`rejectStage: "manual"` = 人工抽检环节驳回。
 
 > 重新提交后：资产状态回到 `under_review`，**`versionId` 会换新**
-> （实测 45584 → 46965），并且只有到这一步
+> （实测 46965 → 48444），并且只有到这一步
 > `pendingVersion.version` 才会同步成**包里的**版本号。
 
 重新提交：
@@ -332,6 +411,29 @@ $PY "$SR" publish <技能目录> --targets workbuddy --yes --changelog "补充�
 ```
 
 （被驳回的资产不用新建，`find_asset` 会按 name 命中并按状态走 `resubmit`。）
+
+---
+
+### 已提交、还在审核，但发现字段填错了
+
+**没有「改一改再提交」这条捷径** —— `publish` 一旦发现资产
+`under_review` 就**整体跳过**（既不上传也不提交，见 `pub_workbuddy.in_review`），
+重跑只会得到一句「已在 open.workbuddy 审核中」。
+
+出路是先撤回，退回 `draft` 再重提：
+
+```bash
+$PY "$SR" withdraw <技能目录>        # 或 withdraw os_xxxxxxxx
+$PY "$SR" publish <技能目录> --targets workbuddy --yes --changelog "修正字段后重提"
+```
+
+`POST /capabilities/{assetId}/withdraw` → `data.status` 变 `draft`。
+撤回不改版本号，重提可用同版本或更高版本。
+
+**代价**：审核计时会重头开始（约 7 个工作日）。所以
+「只改了工具代码、不影响上架内容」这种，权衡一下再决定要不要撤 ——
+2026-10-14 就是因为加了 withdraw 功能本身，把 skill-release 的 1.4.6
+撤回来发成 1.4.7，只为让三端内容一致。
 
 ---
 
@@ -542,14 +644,20 @@ $PY "$SR" creds --set github.identity.email=<邮箱>
 干脆不进 namespace，`opt()` 用 `hasattr` 区分「没给」和「明确给了 False」。
 自检里有 `test_cli` 钉住这个行为。
 
-### 版本号三处不一致
+### 版本号四处不一致
 
 ```bash
 $PY "$SR" ../selftest.py      # test_version 会报出来
 ```
 
-三处指 `release.py` 的 `__version__`、`VERSION.txt`、`SKILL.md` frontmatter。
-`--bump` 会同时改这三处（以及被发布技能的对应位置）。
+四处指 `release.py` 的 `__version__`、`VERSION.txt`、`SKILL.md` frontmatter，
+以及 `_skillhub_meta.json` 里的 `version`。`--bump` 会同时改这四处
+（以及被发布技能的对应位置）。
+
+> `_skillhub_meta.json` 是 1.4.7 起才纳入 `--bump` 的 —— 之前它不在同步范围内，
+> 结果 skill-release 自己就从 1.4.5 一路漂到 1.4.6 都没人发现。
+> 它不影响发布（SkillHub 的版本号取自 SKILL.md frontmatter），
+> 但它是在地记录，漂了会让人误判「哪一版发出去了」。
 
 ### 暂存目录脏了
 

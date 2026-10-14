@@ -117,12 +117,14 @@ $PY "$SR" creds --from-har ~/Downloads/wb.har # ★ open.workbuddy 用这个，�
 |---|---|
 | `party_id` | 入驻主体 ID（如 `psn_…`），对应 `X-Party-Id` 请求头 |
 | `user_agent` | **签发会话那个浏览器的逐字符 UA**；`creds --from-har` 会自动一并抽取 |
-| `categories` | **资质类目**，如 `["tools:office"]`。**为空会被审核驳回**（「无资质类目字段」） |
+| `categories` | **服务（资质）类目**，如 `["tools:office"]`。**为空会被审核驳回**（「服务类目审核：无资质类目字段」） |
 | `market_categories` | 市场展示类目，如 `["development-tools"]`（前台分类用） |
 | `cover_object_key` | 可选；留空则自动上传技能根目录的 `icon.png`（512×512、<500 KB） |
 
-`categories` 的枚举在<https://open.workbuddy.cn/docs/service-categories-individual>
-（个人主体）—— 注意 `GET /capabilities/categories` 给的是**市场类目**，不是资质类目。
+`categories` 的枚举只能从 `GET /api/v2/open-platform/capabilities/business-categories`
+拿（`probe` 可以打）；注意 `GET /capabilities/categories` 给的是**市场类目**，
+是另一套体系。**资质为空时不要下发 `qualifications` 键**（发 `[]` 一样被驳回），
+由 `normalize_categories()` 保证。
 
 ### 怎么取 SkillHub 的凭据（二选一）
 
@@ -167,6 +169,35 @@ $PY "$SR" probe [--cookie "<Cookie>"]
 `/capabilities/list`，报告会话是否有效、各端点是否可达。
 
 **只读。任何情况下不写入。** 用它验证 Cookie 最安全 —— 不会产生审核队列里的垃圾。
+
+---
+
+## withdraw —— 撤回 open.workbuddy 的待审版本
+
+```bash
+$PY "$SR" withdraw <技能目录>            # 按 frontmatter 的 slug/name 找资产
+$PY "$SR" withdraw os_841ab5b3d968503a   # 也可以直接给 assetId
+$PY "$SR" withdraw <目录> --dry-run      # 只打印，不真撤回
+```
+
+`POST /capabilities/{assetId}/withdraw`，把**正在审核**的版本退回 `draft`。
+
+**为什么需要它**：`publish` 遇到资产已在审核中会**直接跳过**
+（既不上传也不提交），所以在「提交后才发现字段填错」时没有别的出路 ——
+只能干等平台驳回。有了 withdraw 就能主动退回来，改完再提。
+
+撤回**不改版本号**，重提可用同版本或更高版本。
+
+| 当前状态 | withdraw 是否有意义 |
+|---|---|
+| `under_review` / `pending` / `auditing` | ✅ 这才是它的用途 |
+| `draft` | ❌ 本来就没提交 |
+| `rejected` | ❌ 被驳回的资产允许直接 `resubmit`，不必先撤 |
+| `approved` / 已上架 | ❌ 上架版本不能用它下架 |
+
+> 路径别写错：`/capabilities/{id}/withdraw` 才通；
+> `/versions/{versionId}/withdraw`、`/cancel-review`、`DELETE /versions/{id}`
+> 全都是 **404**（2026-10-14 实测）。
 
 ---
 

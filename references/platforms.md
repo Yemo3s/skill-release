@@ -114,6 +114,16 @@ tags / license / homepage / changelog`。
 `.md` `.py` `.txt` `.json`
 （来源：`douyin-downloader` 整包上传通过）
 
+### 已被实测拒绝的扩展名（命中即本地 block）
+
+| 扩展名 | 报错原文 | 出处 |
+|---|---|---|
+| `.tsv` | `400 {"error":"不允许的文件类型: reference/icon-map.tsv"}` | 2026-10-13 `probably-stolen` 发布实测 |
+
+`.tsv` 不在白名单里。同内容的制表符文本**改名为 `.txt` 即可通过** ——
+实测路径：把 `reference/icon-map.tsv` 改成 `reference/icon-map.txt`
+（并同步代码/文档里的引用）后重发即成功。规则见 `rules.py` 的 `REJECTED_EXT`。
+
 **`.png` 已被证伪，不要当内容文件传。** 官方 CLI 不传头像，图标走平台元数据；
 把 `icon.png` 当普通文件塞进 `files` 会整包被拒：
 
@@ -212,10 +222,31 @@ GET /api/v2/open-platform/parties
 
 ```
 GET  /api/v2/open-platform/parties
-GET  /api/v2/open-platform/capabilities/categories?capabilityType=skill
+GET  /api/v2/open-platform/capabilities/categories?capabilityType=skill   （市场类目）
+GET  /api/v2/open-platform/capabilities/business-categories               （服务类目树）
+GET  /api/v2/open-platform/capabilities/{assetId}                         （详情，含 fields）
+GET  /api/v2/open-platform/capabilities/{assetId}/reasons                 （驳回原因）
+GET  /api/v2/open-platform/messages                                       （通知流水）
 POST /api/v2/open-platform/capabilities/summary
 POST /api/v2/open-platform/capabilities/list
 ```
+
+**状态变更端点**（2026-10-14 枚举，**非只读**）：
+
+```
+POST /api/v2/open-platform/capabilities/{assetId}/withdraw   （撤回待审 → draft，body 可为空）
+```
+
+- `withdraw` 是把「已提交待审」退回 `draft` 的**唯一**通路。存在的价值：
+  `publish` 遇到资产在审核中会整体跳过，于是在「提交后才发现字段填错」时
+  原本只能干等驳回；现在可以 `release.py withdraw <目录>` 主动退回改完再提。
+  **撤回不改版本号**，重提可用同版本或更高版本。
+- 路径别写错：实测 `/capabilities/{id}/versions/{versionId}/withdraw`、
+  `/capabilities/{id}/cancel-review`、`DELETE /capabilities/{id}/versions/{id}`
+  **全是 404**，只有顶层的 `/capabilities/{id}/withdraw` 通。
+- 同级还有 `update` / `delist` / `publish`（从前端 controller 的动作枚举读出，
+  与 withdraw 并列）；`update` 能给已存在资产补字段，**未实测**，
+  别在审核中的资产上赌它。
 
 **封面/图标通道**（与能力包完全分开，2026-10-12 从前端 bundle 反解）：
 
@@ -240,34 +271,44 @@ fields 推断，**未实测** —— 别在审核中的资产上赌它。
 ⑥ 两端的图标是否**真的生效**，唯一可靠判据是**把远端图下载下来比 md5**，
 不要只看接口有没有返回 URL。
 
-**类目（两套体系，`submit` 时都要给）** —— 2026-10-13 实测（被驳回一次换来的）：
+**类目（两套体系，`submit` 时都要给）** —— 2026-10-14 定稿（被驳回两次换来的）：
 
-| 字段 | 体系 | 取值 | 空着会怎样 |
+| 字段 | 体系 | 取值 | 空着/写错会怎样 |
 |---|---|---|---|
-| `fields.common.categories` | **资质类目** | `[{"categoryId":"tools:office","qualifications":[]}]` | **审核驳回**：「无资质类目字段，需重新选择对应类目，如需资质请一并提交」 |
-| `fields.common.marketCategories` | 市场展示类目 | `["development-tools"]`（连字符 id） | 前台分类缺失 |
+| `fields.common.categories` | **服务（资质）类目** | `[{"categoryId":"tools:office"}]` ← **资质为空时不要带这个键** | **审核驳回**：「服务类目审核：无资质类目字段，需重新选择对应类目」 |
+| `fields.common.marketCategories` | 市场展示类目 | `["development-tools"]`（连字符 id） | 前台分类缺失；控制台要求 1..3 个 |
 
-- 资质类目的**枚举在文档站，不在 API 里**：`GET /capabilities/categories`
-  返回的是**市场类目**（13 个连字符 id），资质类目要到
-  `https://open.workbuddy.cn/docs/service-categories-individual`（个人主体）
-  或 `…/docs/service-categories-enterprise`（非个人主体）翻。
-- 个人主体「**工具**」大类下的三级类目（左列均为 `/`，**不要求资质**）：
-  记账 / 日历 / 天气 / **办公** / **图片处理** / 计算器 / 报价·比价 /
-  信息查询 / 预约·报名 / 健康管理 / 备忘录 —— **没有「开发工具」**，
-  所以技术类技能一般落 `tools:office`。
-- 已确认的 id 映射：办公 → `tools:office`；图片处理 → `tools:image_editing`。
+- ⚠️ **空资质写成 `qualifications: []` 同样会被驳回**，话术与「没选类目」一模一样。
+  控制台源码就是 `a.length > 0 && (t.qualifications = a)` —— 空资质时**整键不发**。
+  详情接口读回来永远归一化成 `"qualifications": []`，**看不出当初发了什么**。
+- **服务类目枚举的唯一权威来源**：`GET /capabilities/business-categories`
+  （前端 `capabilityPort.businessCategories()` 用的就是它）。
+  条目形如 `{"id":"tools:office","name":{"zh":"办公"},"qualificationRequired":false}`。
+  文档站 <https://open.workbuddy.cn/docs/service-categories-individual>
+  只有中文名，没有 id；`GET /capabilities/categories` 给的是**市场类目**，另一套。
+- 个人主体「**工具**」大类下的三级类目（`qualificationRequired` 全为 false）：
+  `tools:bookkeeping` 记账 / `tools:calendar` 日历 / `tools:weather` 天气 /
+  **`tools:office` 办公** / **`tools:image_editing` 图片处理** /
+  `tools:calculator` 计算器 / `tools:price_comparison` 报价·比价 /
+  `tools:info_lookup` 信息查询 / `tools:booking` 预约·报名 /
+  `tools:health_management` 健康管理 / `tools:memo` 备忘录 ——
+  **没有「开发工具」**，所以技术类技能一般落 `tools:office`。
+  全部大类：logistics / education / transportation / daily_life / catering /
+  travel / tools / business_service / sports。
 - 配置写法（凭据文件 `workbuddy` 段）：`"categories": ["tools:office"]`
-  （纯字符串会自动包装成平台要的 `{categoryId, qualifications}` 结构）、
-  `"market_categories": ["development-tools"]`。
+  （纯字符串会自动包装）、`"market_categories": ["development-tools"]`。
   代码侧见 `pub_workbuddy.normalize_categories()`；**空类目会在本地直接抛错**，
   不会等平台驳回。
 - 想抄填法：`GET /capabilities/{assetId}` 的 `data.fields.common`
   能看到已过审资产的真实写法。
+- 驳回原因：`GET /capabilities/{assetId}/reasons`
+  → `data.{rejectStage, reviewDetail:{reviewNote, reviewedAt}}`；
+  平台通知流水见 `GET /messages`。
 
-> 两个易误判点：① `GET /capabilities/categories` 的 13 个是**市场类目**，
-> 不是资质类目，拿它填 `categories` 过不了审；② 提交后要看
-> `pendingVersion.version` 才同步成包里的版本号，draft/rejected 阶段
-> 详情里显示的是旧版本号（别误会成「包没生效」）。
+> 三个易误判点：① `GET /capabilities/categories` 的 13 个是**市场类目**，
+> 不是服务类目，拿它填 `categories` 过不了审；② 空资质发成 `qualifications: []`
+> 照样被打回（见上）；③ 提交后要看 `pendingVersion.version` 才同步成包里的
+> 版本号，draft/rejected 阶段详情里显示的是旧版本号（别误会成「包没生效」）。
 
 ### 硬性规则
 

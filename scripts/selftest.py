@@ -285,6 +285,58 @@ def test_pack(fx: Path, tmp_root: Path) -> None:
     check("断言能抓出无扩展名", any("无扩展名" in p for p in probs), str(probs))
 
 
+def test_rejected_ext(tmp_root: Path) -> None:
+    """被平台**实测拒绝**过的扩展名要在本地就 block，别浪费一次真实上传。
+
+    出处：2026-10-13 probably-stolen 发布时
+        400 {"error":"不允许的文件类型: reference/icon-map.tsv"}
+    """
+    print("[扩展名：实测被拒的一档]")
+    fx = tmp_root / "rejected-ext"
+    (fx / "reference").mkdir(parents=True)
+    (fx / "SKILL.md").write_text(SKILL_MD, encoding="utf-8")
+    (fx / "reference" / "icon-map.tsv").write_text("a\tb\n", encoding="utf-8")
+
+    _, findings = rules.analyze(fx, fm_mod.parse_frontmatter(SKILL_MD),
+                                rules.PLATFORMS, author="mo")
+    codes = {f.code for f in findings}
+    check("REJECTED_EXT 含 .tsv", ".tsv" in rules.REJECTED_EXT,
+          str(sorted(rules.REJECTED_EXT)))
+    check(".tsv 被本地 block", "rejected-ext" in codes, str(sorted(codes)))
+    blocked = [f for f in findings if f.code == "rejected-ext" and f.blocks]
+    check("报错里点名了具体文件",
+          blocked and "icon-map.tsv" in blocked[0].message,
+          blocked[0].message if blocked else "(无)")
+    check(".tsv 不再落进「未验证扩展名」警告",
+          "unverified-ext" not in codes, str(sorted(codes)))
+    check("改名 .txt 后不再被拦",
+          "rejected-ext" not in
+          {f.code for f in rules.analyze(
+              _rename_tsv_to_txt(fx) or fx, fm_mod.parse_frontmatter(SKILL_MD),
+              rules.PLATFORMS, author="mo")[1]})
+
+
+def _rename_tsv_to_txt(root: Path) -> Path:
+    src = root / "reference" / "icon-map.tsv"
+    if src.is_file():
+        src.rename(root / "reference" / "icon-map.txt")
+    return root
+
+
+def test_network_fallback() -> None:
+    """github.com 不通时该走 API 兜底；认证类错误不该误判成网络问题。"""
+    print("[GitHub 网络兜底判定]")
+    import pub_github as gh
+    check("CONNECT tunnel 502 判为网络问题",
+          gh.is_network_failure("fatal: ... CONNECT tunnel failed, response 502"))
+    check("端口连不上判为网络问题",
+          gh.is_network_failure("Failed to connect to github.com port 443 after 21 s"))
+    check("403 不判为网络问题",
+          not gh.is_network_failure("remote: Permission to X denied (403)"))
+    check("认证失败不判为网络问题",
+          not gh.is_network_failure("认证失败：令牌无效"))
+
+
 def test_skillhub_local(fx: Path) -> None:
     print("[SkillHub 本地校验]")
     import pub_skillhub as sh
@@ -666,6 +718,26 @@ def test_workbuddy_upload_contract() -> None:
           == ("create", "republish", "resubmit"))
     check("under_review 常量与前端一致", wb.ASSET_UNDER_REVIEW == "under_review")
 
+    # 服务类目 —— 回归 2026-10-14 那次「空 qualifications」驳回。
+    # 控制台源码是 `a.length > 0 && (t.qualifications = a)`：空资质时**整键不发**。
+    # 发成 `qualifications: []` 会被判成「选了类目却没交资质」，
+    # 打回话术与「压根没选类目」一字不差，非常难查。
+    check("类目：纯字符串自动包装，且不带空 qualifications",
+          wb.normalize_categories(["tools:office"]) == [{"categoryId": "tools:office"}])
+    check("类目：显式传空数组一样要被丢掉",
+          wb.normalize_categories([{"categoryId": "tools:office",
+                                    "qualifications": []}])
+          == [{"categoryId": "tools:office"}])
+    check("类目：真有资质文件时才带 qualifications",
+          wb.normalize_categories([{"categoryId": "tools:office",
+                                    "qualifications": [{"objectKey": "k"}]}])
+          == [{"categoryId": "tools:office",
+               "qualifications": [{"objectKey": "k"}]}])
+    check("类目：空输入 / 空 id → 空列表（由调用方抛错拦住）",
+          wb.normalize_categories(None) == []
+          and wb.normalize_categories([""]) == []
+          and wb.normalize_categories([{"categoryId": "  "}]) == [])
+
     # 「审核中」在列表接口里是 version.status=pending、asset.status=under_review；
     # 详情接口里两个都写成 under_review。只判一个会漏（实测漏过一次）。
     check("认列表形状（version=pending）",
@@ -704,6 +776,32 @@ def test_workbuddy_upload_contract() -> None:
     finally:
         wb.find_asset, wb._call = real_find, real_call
         zipf.unlink(missing_ok=True)
+
+    # 撤回：这是 `upload_and_submit` 那句「审核中直接跳过」的**唯一出路**。
+    # 2026-10-14 枚举出 `POST /capabilities/{assetId}/withdraw`（控制台 bundle
+    # 里查不到，是在 /capabilities 下扫出来的）。钉住路径形状与返回值解析，
+    # 免得以后有人把路径写错成 /versions/{id}/withdraw（那是 404）。
+    seen: list[tuple[str, str]] = []
+
+    def fake_call2(base, path, cookie, *, method="GET", **k):  # noqa: ANN001
+        seen.append((method, path))
+        return 200, {"code": 0, "data": {
+            "assetId": "os_w", "status": "draft",
+            "currentVersion": {"versionId": 47736, "status": "draft"}}}
+
+    real_call2 = wb._call
+    try:
+        wb._call = fake_call2
+        res = wb.withdraw("https://x", "ck", "os_w", party_id="psn_x")
+    finally:
+        wb._call = real_call2
+    check("withdraw 打到 /capabilities/{assetId}/withdraw",
+          seen == [("POST", wb.CAPABILITIES + "/os_w/withdraw")], str(seen))
+    check("withdraw 解析出 draft 与 versionId",
+          res["status"] == "draft" and res["version_id"] == 47736, str(res))
+    check("withdraw 空 assetId 直接抛错",
+          _raises(lambda: wb.withdraw("https://x", "ck", ""), wb.WorkBuddyError))
+    check("withdraw 在 __all__ 里（CLI 要 import 它）", "withdraw" in wb.__all__)
 
 
 def test_github_identity(tmp_root: Path) -> None:
@@ -932,6 +1030,8 @@ def main() -> int:
         test_projection()
         fx = test_rules(tmp_root)
         test_pack(fx, tmp_root)
+        test_rejected_ext(tmp_root)
+        test_network_fallback()
         test_skillhub_local(fx)
         test_creds(tmp_root)
         test_auth_detection()

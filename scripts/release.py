@@ -31,7 +31,7 @@ import frontmatter as fm_mod      # noqa: E402
 import pack                       # noqa: E402
 import rules                      # noqa: E402
 
-__version__ = "1.4.5"
+__version__ = "1.4.8"
 
 DEFAULT_WORKDIR = Path.home() / ".workbuddy" / ".release"
 VERSION_FILE = "VERSION.txt"
@@ -132,6 +132,19 @@ def bump_version(skill_dir: Path, kind: str) -> str:
     if vf.is_file():
         vf.write_text(new + "\n", encoding="utf-8")
 
+    # `_skillhub_meta.json` 里也有一份 version —— 漏掉它会和 VERSION.txt 静默漂移
+    # （skill-release 1.4.5→1.4.6 就这么漂过一次）。能解析就同步，坏了不动它。
+    meta_f = Path(skill_dir) / "_skillhub_meta.json"
+    if meta_f.is_file():
+        try:
+            meta = json.loads(meta_f.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            meta = None
+        if isinstance(meta, dict):
+            meta["version"] = new
+            meta_f.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n",
+                              encoding="utf-8")
+
     touched: list[str] = []
     for py in (Path(skill_dir) / "scripts").glob("*.py"):
         t = py.read_text(encoding="utf-8")
@@ -223,6 +236,22 @@ def do_github(skill: dict, staging: Path, cfg: dict, changelog: str,
                 "message": f"建仓失败：{msg[:300]}"}
 
     ok, out = gh.push(staging, f"{owner}/{slug}")
+    if not ok and gh.is_network_failure(out):
+        # github.com 不通（直连被墙 / 代理对 CONNECT 返 502）时，改走 api.github.com。
+        # 两个域名可达性可以完全不同 —— 实测本机 github.com 超时而 api.github.com 正常，
+        # 于是 git push 必失败。API 兜底产出同一棵树、同一个 noreply 身份。
+        # 提交消息不传，让兜底复用暂存提交的原文，两条通道算出的 SHA 才会一致（幂等）。
+        ok2, out2 = gh.push_via_api(staging, f"{owner}/{slug}")
+        if ok2:
+            last = [ln for ln in out.strip().splitlines() if ln.strip()]
+            return {"target": "github", "ok": True, "status": "pushed",
+                    "url": gh.repo_url(owner, slug),
+                    "message": (f"git push 到 github.com 失败（{last[-1][:120] if last else ''}），"
+                                f"已改走 API 兜底：{out2}")}
+        return {"target": "github", "ok": False, "status": "error",
+                "url": gh.repo_url(owner, slug),
+                "message": (f"git push 失败：{out[-300:]}\n"
+                            f"    API 兜底也失败：{out2[-300:]}")}
     return {"target": "github", "ok": ok, "status": "pushed" if ok else "error",
             "url": gh.repo_url(owner, slug),
             "message": (f"已推送到 {owner}/{slug}（本地提交 {commit}）" if ok
@@ -499,6 +528,54 @@ def cmd_doctor(args) -> int:
     return 0 if fails == 0 else 1
 
 
+def cmd_withdraw(args) -> int:
+    """撤回 open.workbuddy 上**正在审核**的版本，退回 draft，便于修正后重提。
+
+    为什么需要它：`upload_and_submit()` 发现资产在审核中会**直接跳过**，
+    于是「提交后才发现字段填错」就没有补救路径 —— 只能干等驳回。
+    2026-10-14 实测出 `POST /capabilities/{assetId}/withdraw` 可以主动退回。
+    """
+    import pub_workbuddy as wb
+
+    cfg = creds.load()
+    sec = cfg.get("workbuddy", {})
+    cookie = str(sec.get("cookie") or "").strip()
+    if not cookie:
+        print("没有 Cookie。先执行：skill-release creds --set workbuddy.cookie=<值>",
+              file=sys.stderr)
+        return 2
+    _apply_wb_ua(sec)
+    base = str(sec.get("base") or wb.DEFAULT_BASE)
+    party = str(sec.get("party_id") or "")
+    ent = str(sec.get("enterprise_id") or "")
+
+    target = str(args.target or "").strip()
+    asset_id = target if target.startswith("os_") else ""
+    name = str(args.name or "").strip()
+    if not asset_id:
+        skill = load_skill(Path(target or "."))
+        name = name or skill["slug"]
+        asset = wb.find_asset(base, cookie, name, party, ent)
+        if not asset:
+            print(f"没找到名为「{name}」的资产（GET /capabilities/list）", file=sys.stderr)
+            return 1
+        asset_id = str(asset.get("assetId") or "")
+        print(f"命中资产：{name} → {asset_id}（状态 {asset.get('status')}）")
+    if not asset_id:
+        print("无法确定 assetId（既不是 os_ 开头，也没在列表里匹配到）", file=sys.stderr)
+        return 1
+    if args.dry_run:
+        print(f"[演练] 将撤回 {asset_id}，不产生服务端副作用")
+        return 0
+    try:
+        res = wb.withdraw(base, cookie, asset_id, party_id=party, enterprise_id=ent)
+    except wb.WorkBuddyError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(res["message"])
+    return 0
+
+
 def cmd_probe(args) -> int:
     import pub_workbuddy as wb
     cfg = creds.load()
@@ -679,6 +756,15 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--cookie", help="临时指定 Cookie，不写盘")
     add_common(pr, "sub")
     pr.set_defaults(func=cmd_probe)
+
+    wd = sub.add_parser("withdraw",
+                        help="撤回 open.workbuddy 待审版本（退回 draft，修正后可重提）")
+    wd.add_argument("target", nargs="?", default=".",
+                    help="技能目录，或直接给 assetId（os_...）")
+    wd.add_argument("--name", help="按技能名找资产时覆盖名字（默认取 frontmatter 的 slug/name）")
+    wd.add_argument("--dry-run", action="store_true", help="只打印，不真撤回")
+    add_common(wd, "sub")
+    wd.set_defaults(func=cmd_withdraw)
 
     pub = sub.add_parser("publish", help="发布（默认演练，加 --yes 才真发）")
     pub.add_argument("skill", nargs="?", default=".")

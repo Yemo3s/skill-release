@@ -301,3 +301,88 @@ def publish(host: str, token: str, skill_dir: Path, meta: dict,
 
 def skill_url(host: str, slug: str) -> str:
     return f"https://www.skillhub.cn/skills/{urllib.parse.quote(slug, safe='')}"
+
+
+# ---------------------------------------------------------------- 只读查询
+# 「图标传上去了吗、审核到哪一步」以前只能靠肉眼看页面。
+# 其实两个接口就能问清楚（2026-10-13 从前端 bundle 反解 + 实测）：
+#   GET /api/v1/dashboard/skills           → 技能级 iconUrl / reviewStatus
+#   GET /api/v1/dashboard/skills/{slug}/versions
+#                                          → 版本级 iconAuditStatus / reviewStatus
+# 判据（实测对比 approved 与 pending 两种技能得出）：
+#   技能级 iconUrl 非空          ⟺ 图标已生效
+#   版本级 iconAuditStatus=passed ⟺ 图标审核通过（approved 的技能都是 passed 且有
+#                                   iconAuditSubmittedAt 时间戳）
+#   reviewStatus=pending 时技能级 iconUrl 一直是 null —— 图标随版本一起过审，
+#   不是「没传上去」。看到 null 先别急着重传。
+
+__all__ += ["list_my_skills", "list_versions", "icon_report"]
+
+
+def _read(host: str, path: str, token: str = "", cookie: str = "") -> dict:
+    status, body, _ = _request(f"{host.rstrip('/')}{path}", token=token,
+                              cookie=cookie, method="GET")
+    if status != 200:
+        raise SkillHubError(format_error(status, body if isinstance(body, dict) else {}))
+    return body
+
+
+def list_my_skills(host: str, token: str = "", cookie: str = "") -> list[dict]:
+    """我发布的技能列表（含技能级 iconUrl / reviewStatus）。"""
+    body = _read(host, "/api/v1/dashboard/skills", token=token, cookie=cookie)
+    if isinstance(body, list):
+        return body
+    return list(body.get("skills") or body.get("items") or [])
+
+
+def list_versions(host: str, slug: str, token: str = "",
+                  cookie: str = "") -> list[dict]:
+    """某个技能的版本列表（含版本级 iconAudit* / reviewStatus）。"""
+    body = _read(host, f"/api/v1/dashboard/skills/{urllib.parse.quote(slug, safe='')}"
+                       "/versions", token=token, cookie=cookie)
+    if isinstance(body, list):
+        return body
+    return list(body.get("versions") or [])
+
+
+def icon_report(host: str, slug: str, token: str = "",
+                cookie: str = "") -> dict:
+    """图标现状一句话结论 + 原始字段，供 `release.py status` 渲染。"""
+    skills = list_my_skills(host, token=token, cookie=cookie)
+    mine = next((s for s in skills if str(s.get("slug")) == slug), None)
+    if mine is None:
+        return {"found": False, "slug": slug}
+    # 版本接口对个别 slug 会回 403（you are not the owner of this skill，
+    # 2026-10-13 在 skill-release 上复现）——只读探测不能因为一处失败就整体抛错，
+    # 降级为「只有技能级字段」继续给结论。
+    try:
+        versions = list_versions(host, slug, token=token, cookie=cookie)
+    except SkillHubError:
+        versions = []
+    latest = versions[0] if versions else {}
+    icon_url = str(mine.get("iconUrl") or "")
+    audit = str(latest.get("iconAuditStatus") or "")
+    review = str(latest.get("reviewStatus") or mine.get("reviewStatus") or "")
+    submitted = latest.get("iconAuditSubmittedAt")
+    if icon_url:
+        verdict = "图标已生效"
+    elif audit == "passed":
+        verdict = "图标审核已过，等版本过审后生效"
+    elif audit in ("pending", "auditing") and submitted:
+        verdict = "图标已随版本提交，审核中（版本过审后生效）"
+    elif audit in ("pending", "auditing") and not submitted:
+        # 实战判据（2026-10-13）：审核通过的技能 iconAuditSubmittedAt 都有时间戳，
+        # 且下发是秒级的（douyin v1.0.0 提交后 8 秒即写入）。只 pending 而
+        # submitted 一直是 null ⇒ 这一版根本没带 iconUrl，等多久也不会变。
+        verdict = "publish 未携带 iconUrl（无提交时间戳），需带图标重发一版"
+    elif audit == "rejected":
+        verdict = "图标审核未通过，需换图重发一版"
+    else:
+        verdict = "未查到图标提交记录，需要带 iconUrl 重发一版"
+    return {"found": True, "slug": slug, "name": mine.get("name"),
+            "skill_icon_url": icon_url, "review_status": mine.get("reviewStatus"),
+            "latest_version": latest.get("version"),
+            "icon_audit_status": audit,
+            "icon_audit_submitted_at": latest.get("iconAuditSubmittedAt"),
+            "version_review_status": review, "verdict": verdict,
+            "versions": versions}

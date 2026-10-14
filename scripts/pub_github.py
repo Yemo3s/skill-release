@@ -36,10 +36,13 @@ import sys
 from pathlib import Path
 
 __all__ = ["GHX_PY", "GitHubError", "ghx_available", "run_ghx",
-           "prepare_repo", "create_repo", "push", "repo_url",
+           "prepare_repo", "create_repo", "push", "push_via_api",
+           "is_network_failure", "NETWORK_FAIL_MARKERS", "repo_url",
            "noreply_identity", "identity_of", "unsafe_identity",
            "assert_safe_identity", "global_identity",
-           "NOREPLY_DOMAIN", "DEFAULT_IDENTITY"]
+           "NOREPLY_DOMAIN", "DEFAULT_IDENTITY",
+           "is_non_fast_forward", "NON_FF_MARKERS", "remote_head",
+           "reconcile_remote"]
 
 GHX_PY = Path.home() / ".workbuddy" / "skills" / "github-ops" / "scripts" / "ghx.py"
 
@@ -221,6 +224,12 @@ def push(staging: Path, repo_slug: str, branch: str = "main",
     推送前再断言一次身份：ghx 的 `--noreply-identity` 是在 push 时才设
     local config，**改在了 commit 之后**，对已生成的提交毫无作用。
     所以真正的闸门必须在这里 —— 盯的是提交内容，不是 config。
+
+    **非快进自动对齐**：staging 每次 publish 都重建（`git init` + 单条
+    孤儿提交），而远端已有历史时 push 必被拒：
+        ! [rejected] main -> main (fetch first)
+    以前要人工 `reset --soft` 收尾（2026-10-13 手工干过一次），
+    现在就地自动接上，见 `reconcile_remote()`。
     """
     assert_safe_identity(staging)
     args = ["git", "push", str(staging), "--repo", repo_slug, "--branch", branch,
@@ -228,8 +237,262 @@ def push(staging: Path, repo_slug: str, branch: str = "main",
     if not scan:
         args.append("--no-scan")
     r = run_ghx(args)
-    return r.returncode == 0, ((r.stdout or "") + (r.stderr or "")).strip()
+    text = ((r.stdout or "") + (r.stderr or "")).strip()
+    if r.returncode == 0 or not is_non_fast_forward(text):
+        return r.returncode == 0, text
+
+    try:
+        changed, note = reconcile_remote(staging, repo_slug, branch)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{text}\n[x] 非快进自动对齐失败：{exc}"
+    if not changed:
+        return False, f"{text}\n[x] 非快进，且未能自动对齐：{note}"
+
+    r = run_ghx(args)
+    text2 = ((r.stdout or "") + (r.stderr or "")).strip()
+    return r.returncode == 0, f"[i] {note}\n{text2}"
 
 
 def repo_url(owner: str, slug: str) -> str:
     return f"https://github.com/{owner}/{slug}"
+
+
+# ---------------------------------------------------------------- API 兜底
+# 为什么需要这一层（2026-10-13 实测）：
+#
+#   `git push` 走的域名是 **github.com**，而 REST API 走 **api.github.com**。
+#   这两个域名在本机网络里的可达性可以完全不同 —— 实测：
+#
+#     github.com:443      直连超时；沙箱代理对 CONNECT 返回 502   → git push 必失败
+#     api.github.com:443  直连正常                                → API 全通
+#
+#   于是发布链会在最后一步断掉，前三步（打包 / 校验 / 身份隔离）全白做。
+#   兜底做法：改用 Git Data API 把同一棵文件树写成一次提交。
+#   走的是 api.github.com，因此不受 github.com 是否可达影响。
+#
+#   注意 **空仓库**：Git Data API 的 blobs / trees / commits 在「还没有任何提交」
+#   的仓库上全返回 `409 Git Repository is empty`。所以要先用 Contents API
+#   落一个文件把仓库 bootstrap 起来，再建完整树、写 root commit、force 更新 ref
+#   —— 这样分支上只留下一条提交，bootstrap 那条成为不可达对象。
+NETWORK_FAIL_MARKERS = (
+    "connect tunnel failed", "failed to connect", "could not resolve host",
+    "connection timed out", "operation timed out", "connection reset",
+    "connection was reset", "empty reply from server", "proxy error",
+    "response 502", "response 503",
+)
+
+
+def is_network_failure(text: str) -> bool:
+    """这段报错是不是「网络到不了 github.com」，而不是认证/权限问题？
+
+    只有前者才该走 API 兜底 —— 如果是 403 / 认证失败，换个通道照样失败。
+    """
+    low = (text or "").lower()
+    return any(m in low for m in NETWORK_FAIL_MARKERS)
+
+
+# ---------------------------------------------------------------- 非快进对齐
+# 为什么需要（2026-10-14 第二次踩到）：
+#
+#   staging 是**每次 publish 都重建**的临时目录，所以本地永远是一条孤儿提交
+#   （`git init` → 一条 commit，没有父），而远端已经有历史。两边各自成根，
+#   push 必然被拒：
+#
+#     ! [rejected]  main -> main (fetch first)
+#     error: failed to push some refs
+#
+#   它不是网络问题（连接是通的），所以 `is_network_failure` 兜底不会触发 ——
+#   发布链就卡死在最后一步。第一次（2026-10-13）是人工 `git reset --soft`
+#   收尾的，这次把它固化进来。
+#
+#   **别用 rebase**：两个根提交没有共同祖先，rebase 必冲突。
+#   正确做法是 `reset --soft <远端SHA>` —— HEAD 挪到远端之后、索引与工作区
+#   **不动**，于是我们整棵树天然变成「相对远端的改动」，重新 commit 一次
+#   就把新提交接在了远端 HEAD 后面，push 立刻变成快进。
+
+NON_FF_MARKERS = ("non-fast-forward", "[rejected]", "fetch first",
+                  "updates were rejected", "failed to push some refs")
+
+
+def is_non_fast_forward(text: str) -> bool:
+    """这段报错是不是「远端有本地没有的提交」？"""
+    low = (text or "").lower()
+    return any(m in low for m in NON_FF_MARKERS)
+
+
+def remote_head(repo_slug: str, branch: str = "main") -> str:
+    """远端分支顶端的 SHA；仓库为空 / 分支不存在返回 ""。走 api.github.com。"""
+    ghcore = _ghcore()
+    try:
+        token = ghcore.resolve_token()[0]
+        ref = ghcore.api_request("GET", f"/repos/{repo_slug}/git/ref/heads/{branch}",
+                                 token)
+    except Exception:  # noqa: BLE001 —— 404 / 无令牌都当「没有远端历史」
+        return ""
+    if not isinstance(ref, dict):
+        return ""
+    return str((ref.get("object") or {}).get("sha") or "")
+
+
+def reconcile_remote(staging: Path, repo_slug: str, branch: str = "main",
+                     timeout: int = 600) -> tuple[bool, str]:
+    """把本地那条孤儿提交改接到远端 HEAD 之后，让 push 变成快进。
+
+    返回 (是否真的改动过, 说明文本)。任何一步失败都抛 GitHubError。
+    """
+    staging = Path(staging)
+    head = remote_head(repo_slug, branch)
+    if not head:
+        return False, "远端没有该分支（空仓库或名字不对），无需对齐"
+    cur = (_git(staging, "rev-parse", "HEAD").stdout or "").strip()
+    if cur == head:
+        return False, "本地 HEAD 已与远端一致"
+
+    # 远端对象本地多半没有 —— 先 fetch。私有仓库要靠令牌，所以走 ghgit 的
+    # _transfer（它按 askpass → helper 两条路注入令牌，不污染 .git/config）。
+    ghcore, ghgit = _ghcore(), _ghgit()
+    token = ghcore.resolve_token()[0]
+    remotes = ghgit.list_remotes(str(staging))
+    remote = "origin" if "origin" in remotes else (next(iter(remotes), "origin"))
+    https_url, kind = ghgit.normalize_to_https(
+        remotes.get(remote) or f"https://github.com/{repo_slug}.git")
+    if kind == "other":
+        raise GitHubError(f"远程 {remote} 不是 GitHub 地址，无法对齐")
+    ok, text, _variant = ghgit._transfer("fetch", str(staging), token, remote,
+                                         https_url, branch, [], timeout)
+    if not ok:
+        raise GitHubError(f"fetch {branch} 失败：{text[-300:]}")
+
+    # 用远端 SHA 而不是 FETCH_HEAD —— 后者可能被别处覆盖
+    fetched = head
+    msg = (_git(staging, "log", "-1", "--format=%B").stdout or "").strip()
+    _git(staging, "reset", "--soft", fetched)
+    _git(staging, "add", "-A")
+    # 身份已由 prepare_repo 无条件写进仓库级 config（noreply 形态）；
+    # `_git` 又会清掉 GIT_AUTHOR_*/GIT_COMMITTER_*，两条防线都在。
+    _git(staging, "commit", "-q", "-m", msg or "release: 更新技能内容")
+    assert_safe_identity(staging)
+    new = (_git(staging, "rev-parse", "--short", "HEAD").stdout or "").strip()
+    return True, (f"远端 {branch} 已是 {head[:7]}，本地孤儿提交已 reset --soft "
+                  f"接上并重提为 {new}（快进可推）")
+
+
+def _ghcore():
+    """导入 github-ops 的 ghcore（令牌解析与 api_request 都在里面）。"""
+    sys.path.insert(0, str(GHX_PY.parent))
+    import ghcore  # noqa: PLC0415
+
+    return ghcore
+
+
+def _ghgit():
+    """导入 github-ops 的 ghgit（仓库探测 / 带令牌的 fetch）。"""
+    sys.path.insert(0, str(GHX_PY.parent))
+    import ghgit  # noqa: PLC0415
+
+    return ghgit
+
+
+def _staging_meta(staging: Path):
+    """读暂存仓库那条提交的消息 / 身份 / 日期。
+
+    让 API 提交与原 git 提交**逐字一致** —— 输入相同，GitHub 算出的
+    commit SHA 就相同，于是「git push 失败后改走 API」是幂等的，
+    不会因为换了通道就多出一条提交。
+    """
+    r = _git(staging, "log", "-1", "--format=%an%n%ae%n%cn%n%ce%n%aI%n%cI%n%B")
+    lines = (r.stdout or "").split("\n")
+    if len(lines) < 7:
+        raise GitHubError(f"读暂存提交元数据失败：{(r.stdout or r.stderr)[:200]}")
+    an, ae, cn, ce, aI, cI = lines[:6]
+    msg = "\n".join(lines[6:]).strip() + "\n"
+    return (msg, {"name": an, "email": ae}, {"name": cn, "email": ce}, aI, cI)
+
+
+def push_via_api(staging: Path, repo_slug: str, branch: str = "main",
+                 message: str = "", scan: bool = True) -> tuple[bool, str]:
+    """用 Git Data API 把暂存目录推成一个提交。返回 (ok, 报告)。
+
+    与 `push()` 的分工：`push()` 走 git（github.com），本函数走 API
+    （api.github.com）。两者产出的内容与提交身份一致 —— 都把身份显式写成
+    noreply，都不碰账号主邮箱。
+
+    分支已存在时按正常提交追加（`parents=[当前 HEAD]`），不存在时 bootstrap 后
+    写一条 root commit 并 force 建分支 —— 绝不在有历史的仓库上砍历史。
+    """
+    staging = Path(staging).resolve()
+    # 与 push() 同款身份闸门：盯提交内容，而不是 config
+    assert_safe_identity(staging)
+
+    if scan:
+        r = run_ghx(["scan", str(staging), "--include-untracked"])
+        if r.returncode != 0:
+            return False, ("推送前密钥扫描命中高危，已中止（API 兜底同样会拦）：\n"
+                           + ((r.stdout or "") + (r.stderr or ""))[-600:])
+
+    msg, author, committer, aI, cI = _staging_meta(staging)
+    author["date"], committer["date"] = aI, cI
+    message = message or msg
+
+    files = [p for p in sorted(staging.rglob("*"))
+             if p.is_file() and ".git" not in p.relative_to(staging).parts]
+    if not files:
+        return False, "暂存目录里没有可发布的文件"
+
+    g = _ghcore()
+    tok, _src = g.resolve_token()
+
+    try:
+        repo = g.api_request("GET", f"/repos/{repo_slug}", tok)
+    except g.ApiError as exc:
+        return False, f"API 兜底失败：读仓库 {repo_slug} 出错（{exc.status}）{exc.message[:200]}"
+
+    head_sha = ""
+    try:
+        ref = g.api_request("GET", f"/repos/{repo_slug}/git/ref/heads/{branch}", tok)
+        head_sha = str(ref["object"]["sha"])
+    except g.ApiError as exc:
+        if exc.status != 404:
+            return False, f"API 兜底失败：读分支出错（{exc.status}）{exc.message[:200]}"
+
+    # 空仓库：先用 Contents API bootstrap（Git Data API 此时一律 409）
+    if not head_sha:
+        boot = next((p for p in files if p.name == "README.md"), files[0])
+        rel = boot.relative_to(staging).as_posix()
+        import base64  # noqa: PLC0415
+
+        g.api_request("PUT", f"/repos/{repo_slug}/contents/{rel}", tok, body={
+            "message": message, "branch": branch,
+            "content": base64.b64encode(boot.read_bytes()).decode("ascii"),
+            "author": author, "committer": committer,
+        })
+
+    import base64  # noqa: PLC0415
+
+    entries = []
+    for p in files:
+        blob = g.api_request("POST", f"/repos/{repo_slug}/git/blobs", tok, body={
+            "content": base64.b64encode(p.read_bytes()).decode("ascii"),
+            "encoding": "base64"})
+        entries.append({"path": p.relative_to(staging).as_posix(),
+                        "mode": "100644", "type": "blob", "sha": blob["sha"]})
+
+    tree = g.api_request("POST", f"/repos/{repo_slug}/git/trees", tok,
+                         body={"tree": entries})
+    commit_body = {"message": message, "tree": tree["sha"],
+                   "author": author, "committer": committer}
+    if head_sha:
+        commit_body["parents"] = [head_sha]
+    commit = g.api_request("POST", f"/repos/{repo_slug}/git/commits", tok,
+                           body=commit_body)
+
+    if head_sha:
+        g.api_request("PATCH", f"/repos/{repo_slug}/git/refs/heads/{branch}", tok,
+                      body={"sha": commit["sha"], "force": True})
+    else:
+        g.api_request("POST", f"/repos/{repo_slug}/git/refs", tok,
+                      body={"ref": f"refs/heads/{branch}", "sha": commit["sha"]})
+
+    return True, (f"已通过 API 推送（{len(files)} 个文件，提交 {commit['sha'][:8]}，"
+                  f"身份 {author['name']} <{author['email']}>）；"
+                  f"仓库 {repo_url(*repo_slug.split('/'))}")

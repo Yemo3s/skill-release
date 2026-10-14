@@ -62,6 +62,13 @@ MAX_DEPTH = 2
 # 注意 .png 已被**证伪**：icon.png 实测被拒（见上），故不在此列。
 VERIFIED_EXT = {".md", ".py", ".txt", ".json"}
 
+# 已被平台**实测拒绝**的扩展名 —— 比「未验证」更强的一档：不是没试过，是试过被拒。
+# 命中即 block（本地拦下，别浪费一次真实上传）。
+#   .tsv：2026-10-13 probably-stolen 发布时实测
+#        400 {"error":"不允许的文件类型: reference/icon-map.tsv"}
+#        官方 CLI 的扩展名白名单里没有 .tsv；同内容的制表符文本改名 .txt 即可通过。
+REJECTED_EXT = {".tsv"}
+
 # 单平台体积上限 (字节, 来源等级, 出处)
 SIZE_LIMITS = {
     "skillhub": (10 * 1024 * 1024, "verified",
@@ -251,8 +258,17 @@ def analyze(skill_dir: Path, frontmatter_data: dict[str, object] | None = None,
             add("block", "skillhub", "extensionless",
                 f"{rel} 没有扩展名，SkillHub 按扩展名白名单过滤会整包拒绝",
                 "verified", "改名为 <原名>.txt，并同步代码里的引用")
+        rejected = sorted({Path(r).suffix.lower() for r, _ in inv_sh.files
+                           if Path(r).suffix.lower() in REJECTED_EXT})
+        for ext in rejected:
+            hits = [r for r, _ in inv_sh.files if Path(r).suffix.lower() == ext]
+            add("block", "skillhub", "rejected-ext",
+                f"扩展名 {ext} 已被 SkillHub 实测拒绝（400 不允许的文件类型）："
+                f"{'、'.join(hits[:3])}{'…' if len(hits) > 3 else ''}",
+                "verified", "同内容改名 .txt 即可通过，并同步代码/文档里的引用")
         unknown = sorted({Path(r).suffix.lower() for r, _ in inv_sh.files
-                          if Path(r).suffix and Path(r).suffix.lower() not in VERIFIED_EXT})
+                          if Path(r).suffix and Path(r).suffix.lower() not in VERIFIED_EXT
+                          and Path(r).suffix.lower() not in REJECTED_EXT})
         for ext in unknown:
             add("warn", "skillhub", "unverified-ext",
                 f"扩展名 {ext} 未经真实上传验证（已知通过："

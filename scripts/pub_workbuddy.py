@@ -21,9 +21,16 @@
     只读接口：
       GET  /api/v2/open-platform/parties
       GET  /api/v2/open-platform/capabilities/categories?capabilityType=skill  （市场类目）
+      GET  /api/v2/open-platform/capabilities/business-categories              （**服务类目树**）
       GET  /api/v2/open-platform/capabilities/{assetId}                        （详情，含 fields）
+      GET  /api/v2/open-platform/capabilities/{assetId}/reasons                （驳回原因，含 rejectStage）
+      GET  /api/v2/open-platform/messages                                      （平台通知流水）
       POST /api/v2/open-platform/capabilities/summary
       POST /api/v2/open-platform/capabilities/list
+
+    `business-categories` 是**唯一**能给服务类目枚举的接口 —— 文档站只有中文名，
+    `GET /capabilities/categories` 给的是市场类目（另一套体系）。
+    条目形如 `{"id":"tools:office","name":{"zh":"办公"},"qualificationRequired":false}`。
 
     资质类目（`fields.common.categories`）的枚举在**文档站**，不在 API 里：
       https://open.workbuddy.cn/docs/service-categories-individual
@@ -39,9 +46,9 @@ import urllib.request
 from pathlib import Path
 
 __all__ = ["WorkBuddyError", "DEFAULT_BASE", "whoami", "probe", "upload_and_submit",
-           "upload_cover", "normalize_categories", "CAPABILITIES", "PRESIGN",
-           "SCENE_COVER", "sniff_cookie", "cookie_from_har", "find_asset", "unwrap",
-           "set_user_agent", "user_agent"]
+           "upload_cover", "withdraw", "normalize_categories", "CAPABILITIES",
+           "PRESIGN", "SCENE_COVER", "sniff_cookie", "cookie_from_har",
+           "find_asset", "unwrap", "set_user_agent", "user_agent"]
 
 DEFAULT_BASE = "https://open.workbuddy.cn"
 CAPABILITIES = "/api/v2/open-platform/capabilities"
@@ -477,6 +484,48 @@ def find_asset(base: str, cookie: str, name: str, party_id: str = "",
     return None
 
 
+def withdraw(base: str, cookie: str, asset_id: str, *,
+             party_id: str = "", enterprise_id: str = "") -> dict:
+    """撤回 open.workbuddy 上正在审核的版本，把它退回 `draft`。
+
+    **真实契约**（2026-10-14 实测，控制台 bundle 里没有这条，是枚举出来的）：
+
+      POST /api/v2/open-platform/capabilities/{assetId}/withdraw   （body 可为空）
+      → data.{assetId, status:"draft",
+              currentVersion:{versionId, status:"draft"}}
+
+    存在的意义：`upload_and_submit()` 一旦发现 `in_review(asset)` 就**直接跳过**，
+    所以在「提交后才发现字段填错」（例如资质类目那份 2026-10-13 的驳回）
+    时，唯一的补救路径就是 **先 withdraw 退回 draft，再重新提交**。
+    撤回不改版本号，重提可用同版本或更高版本。
+
+    注意：只有**待审**（under_review / pending / auditing）可用；
+    已过审（approved）或已驳回（rejected）的资产调它没有意义
+    （驳回的资产本来就允许直接 resubmit）。
+    """
+    asset_id = str(asset_id or "").strip()
+    if not asset_id:
+        raise WorkBuddyError("withdraw 需要 assetId（os_...）")
+    status, body = _call(base, f"{CAPABILITIES}/{asset_id}/withdraw", cookie,
+                         method="POST", payload={}, party_id=party_id,
+                         enterprise_id=enterprise_id)
+    if status != 200 or code_of(body) not in (0, None):
+        _auth_or_raise(status, body)
+        raise WorkBuddyError(f"撤回失败（{status}）：{_brief(body)}")
+    d = unwrap(body)
+    cur = d.get("currentVersion") or {}
+    return {
+        "ok": True,
+        "asset_id": str(d.get("assetId") or asset_id),
+        "status": str(d.get("status") or "draft"),
+        "version_id": cur.get("versionId"),
+        "message": (f"已撤回待审版本（assetId={asset_id}，"
+                    f"versionId={cur.get('versionId')}），状态回到 draft，"
+                    f"可修正后重新提交"),
+        "response": body,
+    }
+
+
 def _png_size(png_path: Path) -> tuple[int, int]:
     """读 PNG IHDR 拿宽高。坏文件/非 PNG 抛 WorkBuddyError。"""
     try:
@@ -571,18 +620,34 @@ def normalize_categories(cats: list | None) -> list[dict]:
     ⚠️ 只填 `marketCategories` 而 `categories` 为空会被审核驳回：
     「无资质类目字段，需重新选择对应类目，如需资质请一并提交」。
     别等平台驳回，本地就拦住 —— 见下面的前置断言。
+
+    ⚠️⚠️ **空资质绝不能写成 `qualifications: []`**（2026-10-14 第二次驳回换来的）：
+    控制台提交前会跑一遍 `normalizeCategories()`，源码是
+
+        let t = {categoryId: e.categoryId};
+        a.length > 0 && (t.qualifications = a);   // 只有真的有资质文件才带这个键
+
+    —— 也就是**资质为空时整个键都不发**。我们当初老老实实发了
+    `{"categoryId":"tools:office","qualifications":[]}`，字段在详情接口里读回来
+    一模一样（服务端把缺键归一化成 `[]`），但人工审核侧的「服务类目」一栏会判定成
+    「选了类目但资质缺失」→ 打回时给的话术正是「无资质类目字段」。
+    `tools:office` 这类 `qualificationRequired: false` 的类目必须**不带 key** 才能过。
     """
     out: list[dict] = []
     for item in cats or []:
+        cid = ""
+        quals: list = []
         if isinstance(item, str):
             cid = item.strip()
-            if cid:
-                out.append({"categoryId": cid, "qualifications": []})
         elif isinstance(item, dict):
             cid = str(item.get("categoryId") or item.get("id") or "").strip()
-            if cid:
-                quals = [q for q in (item.get("qualifications") or []) if q]
-                out.append({"categoryId": cid, "qualifications": quals})
+            quals = [q for q in (item.get("qualifications") or []) if q]
+        if not cid:
+            continue
+        cat: dict = {"categoryId": cid}
+        if quals:                      # 空资质 = 不带键，别发 []
+            cat["qualifications"] = quals
+        out.append(cat)
     return out
 
 
@@ -720,6 +785,9 @@ def upload_and_submit(base: str, cookie: str, zip_path: Path, *,
     status, body = _call(base, f"{CAPABILITIES}/submit", cookie, method="POST",
                          payload={
                              "capabilityType": capability_type,
+                             # 控制台两个都发（`assetType: A` 与 `capabilityType: A` 同值），
+                             # 少发一个在审核侧可能拿不到按类型切分的字段校验规则。
+                             "assetType": capability_type,
                              "action": action,
                              "assetId": asset_id,
                              "uploadToken": upload_token,
