@@ -31,7 +31,7 @@ import frontmatter as fm_mod      # noqa: E402
 import pack                       # noqa: E402
 import rules                      # noqa: E402
 
-__version__ = "1.4.8"
+__version__ = "1.4.9"
 
 DEFAULT_WORKDIR = Path.home() / ".workbuddy" / ".release"
 VERSION_FILE = "VERSION.txt"

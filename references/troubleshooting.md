@@ -464,6 +464,47 @@ $PY "$SR" publish <技能目录> --targets workbuddy --yes --changelog "修正�
 本技能会先 `git init / add / commit`。若手动调 `ghx` 遇到这情况，
 先在目录里 `git add -A && git commit -m "..."`。
 
+### `! [rejected] main -> main (fetch first)`
+
+```
+ ! [rejected]        main -> main (fetch first)
+ error: failed to push some refs to 'https://github.com/…'
+```
+
+**不是网络问题**（连接是通的），所以 API 兜底那一层不会接手。
+
+成因：staging 是**每次 publish 都重建**的临时目录，本地永远是一条**孤儿提交**
+（`git init` → 一条 commit，无父），而远端已经有历史 —— 两边各自成根，push 必被拒。
+
+**1.4.9 起自动处理**，`push()` 命中这个特征就调 `reconcile_remote()`：
+
+1. 取远端分支 SHA（REST，走 `api.github.com`）；
+2. `ghghit._transfer("fetch", …)` 带令牌把远端对象拉全；
+3. `git reset --soft <远端SHA>` —— HEAD 挪过去，索引与工作区**不动**；
+4. 用原提交的消息 + 原提交的身份重新 commit，新提交就接在远端 HEAD 后面。
+
+**别用 rebase** —— 两个根提交没有共同祖先，rebase 必冲突。
+第一次碰到（2026-10-13）是人工 `reset --soft` 收尾的，现在固化成代码。
+
+### 对齐后的提交丢了 noreply 的数字前缀
+
+```
+作者 A：  Yemo3s <103362262+Yemo3s@users.noreply.github.com>   ← 历史正常形态
+作者 B：  Yemo3s <Yemo3s@users.noreply.github.com>              ← 被改写了
+```
+
+根因在**上游**：push 走的是 `ghx git push --noreply-identity`，而 ghx 的
+`set_noreply_identity()` 会把仓库级 config 改写成**不带数字 id 的旧式 noreply**。
+`reconcile_remote` 如果在它之后才 commit，就会继承这个被改写过的 config。
+
+修法：`reconcile_remote` **从我们自己那条提交里抄身份**（`git log -1 --format=%an%n%ae`），
+用 `git -c user.name=… -c user.email=…` 显式钉在 commit 上，不读 config。
+
+> 两种形态**都不泄漏真名**（`audit` 的白名单按 `@users.noreply.github.com` 后缀判，
+> 两种都过），GitHub 也都能正确归属到账号。所以这只影响一致性，不是安全事故 ——
+> 除非你在意历史里形态统一，否则不必为它改写历史（改历史要强推，
+> 而旧 SHA 仍可直访，见 `提交用了真名` 那一节）。
+
 ### `未配置 github.owner`
 
 ```bash

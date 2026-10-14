@@ -350,6 +350,15 @@ fields 推断，**未实测** —— 别在审核中的资产上赌它。
 注意：`ghx.py git push` **不做 commit**，只负责把已有提交推上去。
 本技能先 `git init / add / commit`，否则会推一个空仓库。
 
+**非快进自动对齐（1.4.9 起）**：staging 每次 publish 都重建，本地永远是孤儿提交，
+而远端已有历史时 push 必被拒（`! [rejected] main -> main (fetch first)`）。
+`push()` 认这个特征后自动 `fetch` → `reset --soft <远端SHA>` → 重提，
+全程不 rebase（双根必冲突）。详见 [troubleshooting.md](./troubleshooting.md)。
+
+⚠️ 一个上游副作用：`ghx git push --noreply-identity` 会把仓库级 config 改写成
+**不带数字 id 的旧式 noreply**。所以对齐时的 commit **必须从原提交抄身份**，
+不能读 config，否则新提交会丢掉数字前缀（形态不一致，但同样不泄漏真名）。
+
 ### 提交身份（GitHub 独有的风险）
 
 **GitHub 是三平台里唯一会把作者身份写进产物的地方。** SkillHub 与

@@ -363,18 +363,30 @@ def reconcile_remote(staging: Path, repo_slug: str, branch: str = "main",
     if not ok:
         raise GitHubError(f"fetch {branch} 失败：{text[-300:]}")
 
-    # 用远端 SHA 而不是 FETCH_HEAD —— 后者可能被别处覆盖
-    fetched = head
+    # 用远端 SHA 而不是 FETCH_HEAD —— 后者可能被别处覆盖。
+    #
+    # 身份必须**从我们自己那条提交里抄**，不能信赖 reset 之后的 local config：
+    # push 走的是 `ghx git push --noreply-identity`，而 ghx 的
+    # `set_noreply_identity()` 会把 local config 改写成**不带数字 id 的旧式
+    # noreply**（`Yemo3s@users.noreply.github.com`），于是这里 commit 出来的
+    # 提交会与历史的 `<id>+Yemo3s@users.noreply.github.com` 形态不一致
+    # —— 2026-10-14 实测踩到过（0fed0914 就是被它污染的）。
+    meta = (_git(staging, "log", "-1", "--format=%an%n%ae").stdout or "").split("\n")
     msg = (_git(staging, "log", "-1", "--format=%B").stdout or "").strip()
-    _git(staging, "reset", "--soft", fetched)
+    a_name = meta[0].strip() if meta else ""
+    a_mail = meta[1].strip() if len(meta) > 1 else ""
+
+    _git(staging, "reset", "--soft", head)
     _git(staging, "add", "-A")
-    # 身份已由 prepare_repo 无条件写进仓库级 config（noreply 形态）；
-    # `_git` 又会清掉 GIT_AUTHOR_*/GIT_COMMITTER_*，两条防线都在。
-    _git(staging, "commit", "-q", "-m", msg or "release: 更新技能内容")
+    pin = (["-c", f"user.name={a_name}", "-c", f"user.email={a_mail}"]
+           if a_name and a_mail else [])
+    _git(staging, *(pin + ["commit", "-q", "-m",
+                           msg or "release: 更新技能内容"]))
     assert_safe_identity(staging)
     new = (_git(staging, "rev-parse", "--short", "HEAD").stdout or "").strip()
+    who = f"{a_name} <{a_mail}>" if a_mail else "（沿用仓库 config）"
     return True, (f"远端 {branch} 已是 {head[:7]}，本地孤儿提交已 reset --soft "
-                  f"接上并重提为 {new}（快进可推）")
+                  f"接上并重提为 {new}（快进可推，身份 {who}）")
 
 
 def _ghcore():

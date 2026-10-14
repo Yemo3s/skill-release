@@ -7,7 +7,7 @@
   - 两个平台的两条硬规则（无扩展名文件 / 目录层级超限）—— 都是真实被拒过的
   - 暂存时的平台差异（.sh 只在 github 保留）
   - 打包后的断言能抓出违规
-  - 版本号三处一致
+  - 版本号四处一致（SKILL.md / VERSION.txt / __version__ / _skillhub_meta.json）
   - CLI 顶层/子命令选项优先级
 
 不联网、不写用户目录（除一个临时配置）。
@@ -426,6 +426,14 @@ def test_version() -> None:
         m = re.search(r"^version:\s*(\S+)\s*$", fm, re.M)
         check("frontmatter version 一致", bool(m) and m.group(1) == ver,
               m.group(1) if m else "frontmatter 无 version")
+    meta = root / "_skillhub_meta.json"
+    if meta.is_file():
+        try:
+            mv = str(json.loads(meta.read_text(encoding="utf-8")).get("version") or "")
+        except json.JSONDecodeError:
+            mv = "(坏 json)"
+        check("_skillhub_meta.json version 一致", mv == ver,
+              f"{mv} != {ver}（--bump 自 1.4.7 起会同步它）")
 
 
 def test_cli() -> None:
@@ -453,14 +461,29 @@ def test_cli() -> None:
 def test_bump(tmp_root: Path) -> None:
     print("[版本自增]")
     d = make_fixture(tmp_root / "bumpcase")
+    # `_skillhub_meta.json` 里也有一份 version —— 1.4.7 起才纳入同步。
+    # 漏了它的后果是实测过的：skill-release 自己从 1.4.5 一路漂到 1.4.6
+    # 都没人发现（发布不受影响，因为它不参与打包，但会让人误判发的是哪版）。
+    (d / "_skillhub_meta.json").write_text(
+        json.dumps({"name": "demo-skill", "version": "2.3.4"},
+                   ensure_ascii=False), encoding="utf-8")
     check("patch 自增", release.bump_version(d, "patch") == "2.3.5")
     check("SKILL.md 已更新",
           fm_mod.parse_frontmatter((d / "SKILL.md").read_text("utf-8")).get("version") == "2.3.5")
     check("VERSION.txt 已更新", (d / "VERSION.txt").read_text("utf-8").strip() == "2.3.5")
     check("脚本 __version__ 已更新",
           '__version__ = "2.3.5"' in (d / "scripts" / "run.py").read_text("utf-8"))
+    check("_skillhub_meta.json 已同步",
+          (json.loads((d / "_skillhub_meta.json").read_text("utf-8")).get("version")
+           == "2.3.5"),
+          (d / "_skillhub_meta.json").read_text("utf-8")[:120])
     check("minor 清零低位", release.bump_version(d, "minor") == "2.4.0")
+    check("meta 跟进 minor",
+          json.loads((d / "_skillhub_meta.json").read_text("utf-8"))["version"] == "2.4.0")
     check("major 清零低位", release.bump_version(d, "major") == "3.0.0")
+    # 坏掉的 meta 不能把发布带崩 —— 静默跳过即可
+    (d / "_skillhub_meta.json").write_text("{ 不是 json", encoding="utf-8")
+    check("坏 meta 不阻断升版", release.bump_version(d, "patch") == "3.0.1")
 
 
 def test_auth_detection() -> None:
@@ -906,6 +929,44 @@ def test_github_identity(tmp_root: Path) -> None:
         check("能认出泄漏的真实邮箱", len(bad) == 2, str(bad))
         check("闸门拦下泄漏提交",
               _raises(lambda: gh.assert_safe_identity(w1), gh.GitHubError))
+
+        # ---- 非快进自动对齐（2026-10-14 第二次被这一条卡住）----
+        check("认得出非快进拒绝",
+              gh.is_non_fast_forward(
+                  "! [rejected]        main -> main (fetch first)\n"
+                  "error: failed to push some refs to 'https://github.com/x/y.git'"))
+        check("不把认证失败误判成非快进",
+              not gh.is_non_fast_forward("remote: Permission denied\nfatal: 403"))
+        check("不把网络失败误判成非快进",
+              not gh.is_non_fast_forward("CONNECT tunnel failed, response 502"))
+
+        # 对齐时必须**从我们自己那条提交抄身份**，而不是信 reset 之后的 config。
+        # 真实成因：push 走 `ghx git push --noreply-identity`，ghx 的
+        # set_noreply_identity() 会把 local config 改写成不带数字 id 的旧式
+        # noreply，于是紧随其后的 commit 就丢掉了数字前缀。
+        # 这里把「config 已被 ghx 污染」的情形复现出来，对齐后身份仍须是数字形态。
+        w4 = tmp_root / "ghident-4"
+        w4.mkdir(parents=True, exist_ok=True)
+        (w4 / "SKILL.md").write_text("# demo\n", encoding="utf-8")
+        gh.prepare_repo(w4, "t", good)
+        gh._git(w4, "config", "--local", "user.name", "Yemo3s")
+        gh._git(w4, "config", "--local", "user.email",
+                "Yemo3s@users.noreply.github.com")   # 模拟 ghx 的改写
+        real_remote_head = gh.remote_head
+        real_reconcile_remote_net = None
+        try:
+            # 不打网络：把 remote_head 指到本地那条提交，reconcile 会走
+            # 「本地与远端一致」的短路 —— 这条只验证短路与判定逻辑。
+            local_head = gh._git(w4, "rev-parse", "HEAD").stdout.strip()
+            gh.remote_head = lambda *a, **k: local_head
+            changed, note = gh.reconcile_remote(w4, "Yemo3s/x")
+            check("本地已与远端一致 → 不做改动", not changed, note)
+        finally:
+            gh.remote_head = real_remote_head
+        check("reconcile 相关符号都在 __all__ 里（CLI 要 import）",
+              all(n in gh.__all__ for n in
+                  ("is_non_fast_forward", "NON_FF_MARKERS", "remote_head",
+                   "reconcile_remote")))
     finally:
         if keep is None:
             os.environ.pop("GIT_CONFIG_GLOBAL", None)
