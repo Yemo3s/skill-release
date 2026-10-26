@@ -241,6 +241,10 @@ POST /api/v2/open-platform/capabilities/{assetId}/withdraw   （撤回待审 →
   `publish` 遇到资产在审核中会整体跳过，于是在「提交后才发现字段填错」时
   原本只能干等驳回；现在可以 `release.py withdraw <目录>` 主动退回改完再提。
   **撤回不改版本号**，重提可用同版本或更高版本。
+- ⚠️ withdraw 后重提会**复用同一个 `versionId`**（驳回后重提才会换新，如
+  46965 → 48444），于是 `pendingVersion.version` **标签不刷新** ——
+  撤回 1.4.6 再提 1.4.9，详情里仍显示 1.4.6。内容是新包，判据看
+  `fields.common.releaseNote`。另有代价是审核计时重头开始。
 - 路径别写错：实测 `/capabilities/{id}/versions/{versionId}/withdraw`、
   `/capabilities/{id}/cancel-review`、`DELETE /capabilities/{id}/versions/{id}`
   **全是 404**，只有顶层的 `/capabilities/{id}/withdraw` 通。

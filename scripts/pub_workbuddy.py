@@ -658,7 +658,9 @@ def upload_and_submit(base: str, cookie: str, zip_path: Path, *,
                      dry_run: bool = False, name: str = "",
                      cover_object_key: str = "",
                      categories: list | None = None,
-                     market_categories: list | None = None) -> dict:
+                     market_categories: list | None = None,
+                     pay_mode: int = 0, pay_amount: int = 0,
+                     pay_days: int = 0) -> dict:
     """走完 init-upload → PUT COS → complete-upload →（可选）submit。
 
     **真实契约**（2026-10-10 从前端 bundle 反解 + 真机实测，替换掉此前靠猜的版本）：
@@ -782,17 +784,32 @@ def upload_and_submit(base: str, cookie: str, zip_path: Path, *,
         action = ACTION_RESUBMIT
     else:
         action = ACTION_REPUBLISH
+    # 付费方式是**版本级**属性且发布后不可改（免费资产服务端拒绝转付费，
+    # 2026-10-26 实测 /pay 端点对 published+payMode=0 返回 update goods failed）。
+    # payMode：0=免费 1=买断 2=订阅；payAmount 单位是**分**。
+    if pay_mode not in (0, 1, 2):
+        raise WorkBuddyError(f"pay_mode 只能是 0/1/2，收到 {pay_mode}")
+    if pay_mode and pay_amount <= 0:
+        raise WorkBuddyError("设了 pay_mode 却没给 pay_amount（单位：分）")
+    pay_detail = []
+    if pay_mode:
+        pd = {"amount": int(pay_amount)}
+        if pay_days:
+            pd["durationDays"] = int(pay_days)
+        pay_detail = [pd]
+
     status, body = _call(base, f"{CAPABILITIES}/submit", cookie, method="POST",
                          payload={
                              "capabilityType": capability_type,
-                             # 控制台两个都发（`assetType: A` 与 `capabilityType: A` 同值），
-                             # 少发一个在审核侧可能拿不到按类型切分的字段校验规则。
+                             # 控制台两个都发（`assetType: A` 与 `capabilityType: A` 同值），少发一个在审核侧可能拿不到按类型切分的字段校验规则。
                              "assetType": capability_type,
                              "action": action,
                              "assetId": asset_id,
                              "uploadToken": upload_token,
                              "clientToken": f"pub_{uuid.uuid4()}",
                              "fields": fields,
+                             **({"payMode": pay_mode, "payDetail": pay_detail}
+                                if pay_mode else {}),
                          },
                          party_id=party_id, enterprise_id=enterprise_id)
     if status != 200 or code_of(body) not in (0, None):
@@ -808,5 +825,55 @@ def upload_and_submit(base: str, cookie: str, zip_path: Path, *,
     result["message"] = (f"已提交审核（assetId={result['asset_id']}，"
                          f"versionId={sdata.get('versionId')}），审核期约 7 个工作日")
     result["response"] = body
+
+    # 付费校验闭环：submit 载荷里的 payMode 不保证被收（服务端可能静默丢弃），
+    # 而付费方式一旦过审就不可改 → 必须立刻回读，没带上就先试 /pay 端点，
+    # 再不行就 withdraw 撤回，绝不让一个「本应收费的资产」以免费形态躺在审核队列里。
+    if pay_mode:
+        aid = result["asset_id"]
+        got_mode = got_detail = None
+        try:
+            st2, b2 = _call(base, f"{CAPABILITIES}/{aid}", cookie, method="GET",
+                            party_id=party_id, enterprise_id=enterprise_id)
+            ver = unwrap(b2).get("pendingVersion") or {}
+            got_mode = ver.get("payMode")
+            got_detail = ver.get("payDetail")
+        except WorkBuddyError:
+            pass
+        if got_mode != pay_mode:
+            # 兜底一：/pay 端点（控制台「付费设置」走的通道），pending 状态下可用
+            try:
+                _call(base, f"{CAPABILITIES}/{aid}/pay", cookie,
+                      method="POST",
+                      payload={"capabilityType": capability_type,
+                               "payMode": pay_mode,
+                               "payDetail": pay_detail},
+                      party_id=party_id, enterprise_id=enterprise_id)
+            except WorkBuddyError:
+                pass
+            # 回读二次确认
+            try:
+                st4, b4 = _call(base, f"{CAPABILITIES}/{aid}", cookie, method="GET",
+                                party_id=party_id, enterprise_id=enterprise_id)
+                ver4 = unwrap(b4).get("pendingVersion") or {}
+                got_mode = ver4.get("payMode")
+                got_detail = ver4.get("payDetail")
+            except WorkBuddyError:
+                pass
+        if got_mode == pay_mode:
+            result["pay"] = {"payMode": got_mode, "payDetail": got_detail,
+                             "verified": True}
+            result["message"] += f"；付费已核验 payMode={got_mode} {pay_detail}"
+        else:
+            try:
+                withdraw(base, cookie, aid, party_id=party_id,
+                         enterprise_id=enterprise_id)
+                rolled = "已自动撤回（退回 draft），未污染审核队列"
+            except WorkBuddyError as exc:
+                rolled = f"自动撤回失败（{exc}），请立即到控制台手动撤回！"
+            raise WorkBuddyError(
+                f"付费信息未生效（期望 payMode={pay_mode} {pay_detail}，"
+                f"实际 payMode={got_mode} payDetail={got_detail}）。{rolled} "
+                f"付费方式过审后不可改，请改用控制台手工提交并设置付费。")
     return result
 

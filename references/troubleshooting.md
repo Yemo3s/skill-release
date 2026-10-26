@@ -430,10 +430,21 @@ $PY "$SR" publish <技能目录> --targets workbuddy --yes --changelog "修正�
 `POST /capabilities/{assetId}/withdraw` → `data.status` 变 `draft`。
 撤回不改版本号，重提可用同版本或更高版本。
 
-**代价**：审核计时会重头开始（约 7 个工作日）。所以
-「只改了工具代码、不影响上架内容」这种，权衡一下再决定要不要撤 ——
+⚠️ **撤回的代价，两条（2026-10-14 实测）**：
+
+1. **审核计时会重头开始**（约 7 个工作日）。
+2. **`versionId` 会被复用，`pendingVersion.version` 标签不刷新** ——
+   撤回 1.4.6（versionId 48444）后重提 1.4.9，`submit` 回的还是
+   versionId 48444，详情里 `pendingVersion.version` 依然显示 **1.4.6**。
+   内容确实是新包（判据：`fields.common.releaseNote` 已是新提交的文案），
+   但**版本号标签停留在该 version 记录第一次解析出来的值**。
+   （被**驳回**后重提则会换新 versionId，例如 46965 → 48444，不在此列。）
+
+   所以拿不到「干净版本号」时，别怀疑包没生效 —— 先看 `releaseNote`。
+
+因此「只改了工具代码、不影响上架内容」这种，权衡一下再决定要不要撤。
 2026-10-14 就是因为加了 withdraw 功能本身，把 skill-release 的 1.4.6
-撤回来发成 1.4.7，只为让三端内容一致。
+撤回来发成 1.4.9，只为让三端内容一致。
 
 ---
 

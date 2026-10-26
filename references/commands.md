@@ -188,6 +188,10 @@ $PY "$SR" withdraw <目录> --dry-run      # 只打印，不真撤回
 
 撤回**不改版本号**，重提可用同版本或更高版本。
 
+⚠️ 两条代价（2026-10-14 实测）：① 审核计时从头发起；② **`versionId` 会被复用，
+`pendingVersion.version` 标签不刷新** —— 撤回后重提更高版本号，详情里显示的还是
+旧号（内容是新包，判据看 `releaseNote`）。所以「只改了工具代码」这种不必急着撤。
+
 | 当前状态 | withdraw 是否有意义 |
 |---|---|
 | `under_review` / `pending` / `auditing` | ✅ 这才是它的用途 |

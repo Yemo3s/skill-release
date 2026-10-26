@@ -5,7 +5,7 @@ display_name_en: Skill Release Manager
 description: "把本地技能一句话发到 GitHub / SkillHub / open.workbuddy 三处，并把两个平台的校验规则前置成本地断言。TRIGGER: 用户说「发布这个技能」「上架 skill」「更新到 skillhub」「推到 open.workbuddy」「同步到 GitHub」「技能发布报解析失败」「目录层级超限」「不允许的文件类型」「slug 已被封禁」「slug 冲突」「图标不让传」「撤回待审版本」「改完再重新提交」，或给出技能目录要求分发。DO NOT TRIGGER: 只是新建技能骨架（属于 skill-scaffold）；只是查找/安装别人的技能；只是普通代码提交。"
 description_zh: 把技能一次分发到三个平台：GitHub 仓库、SkillHub 市场、open.workbuddy。同一份内容派生三种形态，平台要的字段（slug / displayName / author）自动投影到临时副本而不污染源文件；发布前跑规则引擎，把「无扩展名文件」「根目录图标」「目录层级超限」「slug 被封禁」这类真实被拒过的坑拦在本地。SkillHub 支持 API Key 与会话 Cookie 两条凭据通道。默认演练，加 --yes 才真发。
 description_en: "Release a skill to three platforms in one command: a GitHub repo, the SkillHub marketplace, and open.workbuddy. One source of content, three packaging shapes; platform-specific frontmatter (slug / displayName / author) is projected into a staging copy instead of polluting the source. A rule engine blocks locally the exact failures platforms rejected before — extensionless files, root-level icons, over-deep paths, banned slugs. SkillHub accepts either an API key or a browser session cookie. Dry-run by default; --yes to actually publish."
-version: 1.4.9
+version: 1.5.3
 allowed-tools: Bash, Read, Write, Glob, Grep, AskUserQuestion
 category: 开发编程
 license: MIT
@@ -111,23 +111,81 @@ $PY "$SR" publish "<技能目录>" --yes --bump patch
 
 默认走三个平台。未配置凭据的平台会**跳过并在结果里标注**，不影响其他平台。
 
+### 登录（推荐：扫码，不用导 HAR）
+
+```bash
+$PY "$SR" login                       # 弹出浏览器 → 你扫码 → 自动收尾
+$PY "$SR" login --timeout 600         # 慢慢扫
+$PY "$SR" login --fresh               # 换一个全新 profile（旧会话残留时用）
+$PY "$SR" login --check-only          # 只验活，不开浏览器
+```
+
+**用户只需要做一件事：扫码。其余四步全自动。**
+
+1. 用**系统 Chrome**（找不到退 Edge）**直接打开登录页**
+   `https://open.workbuddy.cn/login/?platform=open&state=0`，带持久化 profile
+2. 你扫码后，脚本在**页面里** fetch `/api/v2/open-platform/parties` 判断登录态
+3. 把会话连同 `navigator.userAgent` **一起**写进凭据 ——
+   平台会话与 UA 绑定，cookie 对了 UA 不对照样 302
+4. 顺手抓 `party_id`、留一份 `storage_state` 备用
+
+三个踩过的坑，改代码时别退回去：
+
+- **必须直接进登录页**。落到首页时，如果 profile 里还有半个失效会话，
+  首页不渲染二维码，用户会以为「窗口打开了但没反应」。
+- **不要靠 cookie 名字判断登录**。`session` 这种名字在过期的 profile 里照样存在，
+  于是「一进去就以为登了」→ 反复验活失败 → 空等到超时。
+  只有页面内 fetch 的结果可信（自带 cookie + UA + TLS 指纹）。
+- **profile 被占用时不要硬抢**。Chrome 锁住 `SingletonLock` 后，再启动只会把 URL
+  转给已有窗口然后自己退出（Playwright 报 `TargetClosedError`），连 cookie 都拿不到。
+  脚本会检测到锁并自动换一个带时间戳的目录。
+
+> profile 落在 `~/.workbuddy/.secrets/wb-browser-profile/`，复用登录态 ——
+> 第二次以后窗口一开往往就是已登录，连扫码都省了。
+> 想清空旧会话用 `--fresh`：脚本是把整个目录**移走**而不是删除 ——
+> profile 动辄数百个文件，`rmtree` 会撞上批量删除守卫。
+
+### 看数据（定价、选题之前先跑这个）
+
+```bash
+$PY "$SR" metrics                      # 默认回溯 90 天
+$PY "$SR" metrics --days 30            # 看近一月
+$PY "$SR" metrics --only 抖音           # 只看某个资产
+$PY "$SR" metrics --out wb-metrics.json
+```
+
+输出每个资产的 **安装 / 活跃 / 调用 / 频次 / 周留存 / 月留存** 与付费模式。
+保留率是含真话的那个指标：装机高但周留存个位数，说明它是「一次性工具」，
+用户心里没有复购理由，硬改成订阅必失败。
+
+两个口径陷阱，脚本会自动标注：
+
+- `installs` 在某天之前恒为 0、之后突然三位数 —— 多半是**埋点/口径上线或回填**，
+  不是流量爆发。判据是同日的 `activeUsers`：真新增 200+ 装机，当日活跃不可能只有 50。
+- 指标是 `{value, status}`，`status=pending` 表示口径未就绪，**不是 0**。
+  直接把 null 当 0 画图，会得出「留存为零」的错结论。
+
+接口契约（2026-10-26 实测，靠报错问出来的，别再猜）：
+`POST /api/v2/open-platform/asset-metrics/daily`，
+字段是 `assetIds` / `metricTypes` / **`startTime` / `endTime`**（不是 startDate），
+指标枚举 `installs,calls,activeUsers,frequency,weekRetention,monthRetention`。
+
 ### 凭据
 
 ```bash
 $PY "$SR" creds                                            # 查看（脱敏）
 $PY "$SR" creds --set skillhub.key=skh_xxxx
 $PY "$SR" creds --set skillhub.cookie='skh_token=<JWT>; sid=<sid>'
-$PY "$SR" creds --set workbuddy.cookie='<浏览器 Cookie>'
+$PY "$SR" creds --set workbuddy.cookie='<浏览器 Cookie>'   # 不推荐，用 login
 $PY "$SR" creds --set author=mo
 $PY "$SR" creds --set github.owner=<GitHub 用户名>
-$PY "$SR" creds --from-har ~/Downloads/wb.har   # open.workbuddy 用 HAR，别手抄
+$PY "$SR" creds --from-har ~/Downloads/wb.har   # login 跑不通时的兜底
 ```
 
 SkillHub 有 Key 和 Cookie 两条路，**配一条就够**；两条都配时以 Cookie 优先。
-open.workbuddy 的 `session` 登录后约 4 KB，手工复制会被截断 ——
-用 `--from-har` 从浏览器导出的 HAR 里抽，它会先自检、再验活，**通过才写盘**。
-⚠️ 导 HAR 前**必须**在 DevTools 里勾上「允许生成包含敏感数据的 HAR」
-（Chrome 130 起默认导出「已清理」档，Cookie 会被剥光，症状酷似「没登录」）。
+open.workbuddy 走 `login` 即可；确实要导 HAR 时，⚠️ 必须先在 DevTools 里勾上
+「允许生成包含敏感数据的 HAR」（Chrome 130 起默认导出「已清理」档，
+Cookie 会被剥光，症状酷似「没登录」）。
 
 ### 探测 open.workbuddy
 
@@ -140,11 +198,30 @@ $PY "$SR" probe
 
 打网络之前会先跑一遍 **Cookie 完整性自检** —— 「Cookie 是坏的（复制被截断）」
 和「没登录」响应长得一模一样（都是 302 → Keycloak），但 Cookie 结构分得清：
-本站 `session` 固定是 4 段 `<22位id>|<10位过期>|<payload>|<27位HMAC>`，
-登录后约 4 KB，**手工复制几乎必然被截断**，末尾 HMAC 一丢就 302。
-长值请走 `Network → 右键 → 复制 → 将所有内容另存为 HAR（包含敏感数据）`，
-别走剪贴板；只点「导出 HAR」不勾上面那个开关的话，导出的 HAR 里**一个 Cookie 都没有**。
+本站 `session` 固定是 4 段 `<22位id>|<10位过期>|<payload>|<27位HMAC>`。
+**这套自检是给 HAR 兜底路径用的** —— 主路径是 `login` 扫码，脚本自己抓
+完整 Cookie + 真实 UA，根本不存在截断问题，也不依赖 UA 一致性
+（平台会话绑定 UA，这是手抄 Cookie 反复失效的根因）。
+只有当 `login` 跑不通（无图形环境等）才退回 HAR，且必须先在 DevTools 里勾
+「允许生成包含敏感数据的 HAR」，别走剪贴板。
 详见 [references/troubleshooting.md](./references/troubleshooting.md)。
+
+### 付费资产的铁律（2026-10-26 实测）
+
+payMode 是**版本级**属性（`currentVersion.payMode`：0=免费 1=买断 2=订阅），
+金额单位是**分**。三条死路 + 一条活路：
+
+1. **API `submit` 会静默丢弃 payMode** —— 载荷里带上也不收，回读 `pendingVersion.payMode` 恒为 0
+2. **`POST /capabilities/{assetId}/pay`（控制台"付费设置"通道）**：
+   对 published+payMode=0 返回 `update goods failed`（免费转付费被服务端拒绝）；
+   对 draft / pending 同样 `update goods failed`，载荷变体（durationDays/goodsType/goods 数组）全试过，均不收
+3. **已过审的免费资产永远变不成付费** —— 与官方 FAQ 一致
+4. **活路只有一条：在控制台 UI 里提交时设置付费方式** —— 自动化能做的是把包、
+   类目、封面全部放进草稿，最后一步「设置付费 + 提交」必须人点
+
+所以 `upload_and_submit()` 的行为是：带 `pay_mode` 提交 → 回读验证 →
+没带上就自动 withdraw 撤回并报错，**绝不留下一个「本应收费却免费」的待审版本**。
+草稿已就位时，引导用户去控制台完成最后一步（设付费 → 提交）。
 
 ### 撤回 open.workbuddy 的待审版本
 
@@ -212,6 +289,26 @@ commit 元数据里的姓名 / 邮箱写进去几乎删不掉（`force push` 只
 用户：发个新版本
 代理：release.py publish <技能目录> --yes --bump patch --changelog "……"
       先说明 --bump 会改哪三个地方
+```
+
+**场景五：cookie 过期了**
+
+```
+用户：会话失效了 / 帮我重新登录
+代理：release.py login --timeout 600
+      → 弹窗停在登录页，只说一句「请扫码」
+      → 扫完自动抓 cookie + UA + party_id，然后 release.py probe 复核
+      ⚠️ 不要让用户导 HAR、不要让他手抄 Cookie
+```
+
+**场景六：想定价 / 想收费，先看盘子**
+
+```
+用户：我这个技能有量了，能收费吗
+代理：release.py metrics --days 90
+      → 先看 payMode：已上架的免费资产平台不支持转付费，要收费只能新发资产
+      → 再看周留存：留存个位数的资产没有复购理由，买断比订阅现实
+      → 装机高但留存低 = 选题好、交付完就走，别指望在同一资产上收钱
 ```
 
 ## 三个平台的通道性质

@@ -31,7 +31,7 @@ import frontmatter as fm_mod      # noqa: E402
 import pack                       # noqa: E402
 import rules                      # noqa: E402
 
-__version__ = "1.4.9"
+__version__ = "1.5.3"
 
 DEFAULT_WORKDIR = Path.home() / ".workbuddy" / ".release"
 VERSION_FILE = "VERSION.txt"
@@ -344,7 +344,10 @@ def do_workbuddy(skill: dict, staging: Path, cfg: dict, changelog: str,
             market_categories=sec.get("market_categories") or None,
             party_id=str(sec.get("party_id") or ""),
             enterprise_id=str(sec.get("enterprise_id") or ""),
-            changelog=changelog, submit=submit, dry_run=not realize)
+            changelog=changelog, submit=submit, dry_run=not realize,
+            pay_mode=int(sec.get("pay_mode") or 0),
+            pay_amount=int(round(float(sec.get("pay_amount") or 0) * 100)),
+            pay_days=int(sec.get("pay_days") or 0))
     except wb.WorkBuddyError as exc:
         return {"target": "workbuddy", "ok": False, "status": "error",
                 "zip": str(zip_path), "message": str(exc)}
@@ -576,6 +579,55 @@ def cmd_withdraw(args) -> int:
     return 0
 
 
+def _playwright_python() -> str:
+    """找装了 playwright 的解释器。
+
+    release.py 自己跑在托管 Python 上（不带 playwright），所以扫码登录这步
+    要借隔离 venv 的解释器 —— 不在主环境里装重依赖，避免污染发布链路。
+    """
+    cands = [
+        Path.home() / ".workbuddy/binaries/python/envs/default/Scripts/python.exe",
+        Path.home() / ".workbuddy/binaries/python/envs/default/bin/python",
+    ]
+    for c in cands:
+        if c.is_file():
+            return str(c)
+    return ""
+
+
+def cmd_login(args) -> int:
+    """扫码登录 open.workbuddy.cn，自动把会话写进凭据。
+
+    比导 HAR 少三步：不用开 DevTools、不用勾「含敏感数据」、不用手抄 4 KB 的
+    session（手抄必被截断）。同时会把浏览器真实 UA 一起写进去 ——
+    平台会话与 UA 绑定，cookie 对了 UA 不对照样 302。
+    """
+    import subprocess
+
+    script = Path(__file__).resolve().parent / "login_workbuddy.py"
+    if not script.is_file():
+        print(f"缺少登录脚本：{script}", file=sys.stderr)
+        return 2
+
+    py = _playwright_python()
+    if not py:
+        print("未找到装了 playwright 的解释器。先建隔离环境：", file=sys.stderr)
+        print("  <托管python> -m venv ~/.workbuddy/binaries/python/envs/default", file=sys.stderr)
+        print("  ~/.workbuddy/binaries/python/envs/default/Scripts/python.exe -m pip install playwright",
+              file=sys.stderr)
+        return 2
+
+    cmd = [py, str(script)]
+    if getattr(args, "check_only", False):
+        cmd.append("--check-only")
+    else:
+        cmd += ["--timeout", str(int(getattr(args, "timeout", 300) or 300))]
+        if getattr(args, "fresh", False):
+            cmd.append("--fresh")
+
+    return subprocess.call(cmd)
+
+
 def cmd_probe(args) -> int:
     import pub_workbuddy as wb
     cfg = creds.load()
@@ -600,6 +652,25 @@ def cmd_probe(args) -> int:
                                         str(sec.get("enterprise_id") or "")):
         print(f"  {label:<34} {result:<10} {note}")
     return 0
+
+
+def cmd_metrics(args) -> int:
+    """看自己已发资产到底有多少人在用 —— 定价与选题之前先看这张表。
+
+    比凭感觉判断可靠的地方：留存是含真话的指标。装机高但周留存个位数，
+    说明是「一次性工具」，用户情绪里没有复购理由，硬转订阅必失败。
+    """
+    script = Path(__file__).resolve().parent / "metrics_workbuddy.py"
+    if not script.is_file():
+        print(f"缺少指标脚本：{script}", file=sys.stderr)
+        return 2
+    import subprocess
+    cmd = [sys.executable, str(script), "--days", str(int(args.days))]
+    if getattr(args, "out", None):
+        cmd += ["--json", args.out]
+    if args.only:
+        cmd += ["--only", args.only]
+    return subprocess.call(cmd)
 
 
 def cmd_publish(args) -> int:
@@ -756,6 +827,22 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--cookie", help="临时指定 Cookie，不写盘")
     add_common(pr, "sub")
     pr.set_defaults(func=cmd_probe)
+
+    mt = sub.add_parser("metrics",
+                        help="看已发资产的真实运营指标（安装/活跃/调用/留存），只读")
+    mt.add_argument("--days", type=int, default=90, help="回溯天数，默认 90")
+    mt.add_argument("--out", metavar="FILE", help="把汇总另存为 JSON 文件")
+    mt.add_argument("--only", metavar="NAME", help="只看名称包含该串的资产")
+    add_common(mt, "sub")
+    mt.set_defaults(func=cmd_metrics)
+
+    lg = sub.add_parser("login",
+                        help="扫码登录 open.workbuddy（会自动抓 Cookie 与 UA，不用导 HAR）")
+    lg.add_argument("--timeout", type=int, default=300, help="等待扫码的秒数，默认 300")
+    lg.add_argument("--check-only", action="store_true", help="只验活，不打开浏览器")
+    lg.add_argument("--fresh", action="store_true", help="清空旧浏览器 profile 再登录")
+    add_common(lg, "sub")
+    lg.set_defaults(func=cmd_login)
 
     wd = sub.add_parser("withdraw",
                         help="撤回 open.workbuddy 待审版本（退回 draft，修正后可重提）")
