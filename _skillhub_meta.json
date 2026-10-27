@@ -2,7 +2,7 @@
   "name": "skill-release",
   "installedAt": 0,
   "source": "local",
-  "version": "1.5.9",
+  "version": "1.5.11",
   "skillId": "",
   "examples_zh": [
     "把 douyin-downloader 发布到三个平台",

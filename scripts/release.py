@@ -32,7 +32,7 @@ import pack                       # noqa: E402
 import rules                      # noqa: E402
 import watchlist                  # noqa: E402
 
-__version__ = "1.5.9"
+__version__ = "1.5.11"
 
 DEFAULT_WORKDIR = Path.home() / ".workbuddy" / ".release"
 VERSION_FILE = "VERSION.txt"
@@ -507,6 +507,16 @@ def cmd_check(args) -> int:
                     rc["verdict"], "verified",
                     "这只是估算（转化率按 10% 拍的）。人群要取「已证明会装这类东西的人」，"
                     "不是全平台用户数。要不要做你定 —— 拿它当参考，别当判决"))
+        # 付费技能 × 公开仓库：GitHub 上能白嫖全量源码，wb 的 ¥29 就卖空了。
+        # 凭据默认 github.private=true，显式设 false 才会命中 —— 命中即提醒。
+        if pm and not (cfg.get("github", {}) or {}).get("private", True):
+            findings.append(rules.Finding(
+                "warn", "github", "paid-public-repo",
+                "技能配置了 wb 付费，但 GitHub 侧是公开仓库 ——"
+                "付费内容可在 GitHub 白嫖全量源码",
+                "verified",
+                "确认这是引流策略就忽略；否则 github.private=true 私有化，"
+                "或 GitHub 网页上把现有仓库转 Private"))
     if want_json(args):
         print(json.dumps({
             "skill": skill["slug"], "version": skill["version"], "dir": str(skill["dir"]),
