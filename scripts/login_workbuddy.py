@@ -368,6 +368,85 @@ def run_login(timeout: int, fresh: bool = False) -> int:
     return 0
 
 
+def run_refresh() -> int:
+    """从持久化 profile 里把**当前有效**的会话倒回配置，不开窗口、不用扫码。
+
+    为什么需要：Chrome 会在后台静默刷新 SSO 会话，profile 里的 cookie 一直是活的，
+    但配置里那份字符串是某次扫码时抄下来的快照 —— 过几小时就 403，
+    而 profile 本身还能正常访问控制台。此时不该逼用户重新扫码，
+    只要把 profile 里的现成 cookie 重新导出即可。
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        log("缺少 playwright。")
+        return 2
+    kind, exe = pick_browser()
+    if not exe:
+        log("未找到 Chrome / Edge。")
+        return 2
+    if not PROFILE.exists():
+        log(f"没有可复用的 profile（{PROFILE}），请先跑一次完整登录（不带 --refresh）。")
+        return 1
+
+    with sync_playwright() as pw:
+        try:
+            ctx = pw.chromium.launch_persistent_context(
+                user_data_dir=str(PROFILE), executable_path=exe, headless=True,
+                args=["--disable-blink-features=AutomationControlled", "--no-first-run"],
+                viewport={"width": 1280, "height": 800})
+        except Exception as exc:
+            log("启动 profile 失败：" + str(exc).splitlines()[0][:200])
+            return 2
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto(BASE + "/skill/all", wait_until="domcontentloaded", timeout=60000)
+        time.sleep(2)
+        ok, note = probe_in_page(page)
+        if not ok:
+            log(f"profile 里的会话也失效了（{note}），需要重新扫码：release.py login")
+            ctx.close()
+            return 1
+        ua = ""
+        try:
+            ua = page.evaluate("() => navigator.userAgent") or ""
+        except Exception:
+            pass
+        cookies = ctx.cookies()
+        cookie_str = cookie_header(cookies)
+        party_id = ""
+        try:
+            r = page.evaluate("""async () => {
+              const r = await fetch('/api/v2/open-platform/parties', {credentials:'include'});
+              return await r.text();
+            }""")
+            body = json.loads(r)
+            for p in ((body.get("data") or {}).get("parties") or []):
+                pid = p.get("partyId") or p.get("id")
+                if pid:
+                    party_id = str(pid)
+                    break
+        except Exception:
+            pass
+        ctx.close()
+
+    if not cookie_str:
+        log("profile 有效但没抓到 cookie，异常状态。")
+        return 1
+    cfg = load_cfg()
+    wb = cfg.setdefault("workbuddy", {})
+    wb["cookie"] = cookie_str
+    if ua:
+        wb["user_agent"] = ua
+    if party_id:
+        wb["party_id"] = party_id
+    save_cfg(cfg)
+    log("✅ 已从浏览器 profile 刷新凭据（无需扫码）")
+    log(f"   workbuddy.cookie     ：{mask(cookie_str)}")
+    if party_id:
+        log(f"   workbuddy.party_id   ：{party_id}")
+    return 0
+
+
 def run_check() -> int:
     cfg = load_cfg()
     wb = cfg.get("workbuddy", {})
@@ -387,9 +466,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--timeout", type=int, default=300, help="等待登录的秒数（默认 300）")
     ap.add_argument("--check-only", action="store_true", help="只验活，不开浏览器")
     ap.add_argument("--fresh", action="store_true", help="清空旧 profile 再登录（旧会话残留时用）")
+    ap.add_argument("--refresh", action="store_true",
+                    help="不开窗口：从浏览器 profile 里把当前有效会话重新导出到配置")
     args = ap.parse_args(argv)
     if args.check_only:
         return run_check()
+    if args.refresh:
+        return run_refresh()
     return run_login(args.timeout, fresh=args.fresh)
 
 

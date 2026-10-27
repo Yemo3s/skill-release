@@ -205,6 +205,70 @@ $PY "$SR" withdraw <目录> --dry-run      # 只打印，不真撤回
 
 ---
 
+## pay —— 回看付费状态（只读）
+
+```bash
+$PY "$SR" pay <技能目录>              # 按 frontmatter 的 slug/name 找资产
+$PY "$SR" pay os_e1a727dfe880fe87     # 也可以直接给 assetId
+$PY "$SR" pay <技能目录> --json
+```
+
+读 `GET /capabilities/{assetId}`，输出：
+
+```
+资产 os_e1a727dfe880fe87
+  状态      ：under_review（版本 1.0.0 / under_review）
+  付费方式  ：一次性买断 ¥29
+  原始字段  ：[{"price": 2900, "duration_days": 0}]
+```
+
+**为什么必须有这条命令**：付费是版本级属性、过审即锁死，而「界面上显示 29 元」
+和「服务端记的是 29 元」是两件事（2026-10-26 就出现过前者对、后者是免费）。
+发布前后各跑一次，比事后撤回便宜得多。
+
+---
+
+## watch —— 审核巡航（发布后自动盯到上线）
+
+```bash
+$PY "$SR" watch                        # 列出在等的资产（版本/定价/查过几次）
+$PY "$SR" watch --check                # 巡检一次，只读
+$PY "$SR" watch --check --ship         # 巡检 + 过审的自动上线   ← 定时任务跑这个
+$PY "$SR" watch --check --json         # 结构化输出，含 done
+$PY "$SR" watch --asset os_xxx         # 只针对一个资产
+$PY "$SR" watch --stop                 # 停止巡航（清空登记）
+$PY "$SR" watch --stop --asset os_xxx  # 只摘掉一个
+```
+
+**登记不需要手工做**：`publish --yes` 提交成功后自动写入
+（结果行出现 `watched: true`）。列表在 `~/.workbuddy/.release/watch.json`。
+
+`--json` 输出：
+
+```jsonc
+{
+  "checked": 2,
+  "results": [
+    {"assetId": "os_...", "action": "shipped",   "remote_status": "approved",     "note": "已发布上线（...）"},
+    {"assetId": "os_...", "action": "waiting",   "remote_status": "under_review"},
+    {"assetId": "os_...", "action": "rejected",  "remote_status": "rejected",     "note": "<驳回原文>"}
+  ],
+  "remaining": [...],                          // 还在等的条目
+  "summary": {"total": 1, "done": false, "waiting": 1, "needs_human": 0},
+  "done": false                                // true = 全部落地，巡航可停
+}
+```
+
+`action` 取值：`shipped`（本次上线）/ `done`（本来就在线）/ `waiting`（等审核）/
+`rejected` / `withdrawn` / `ship_failed`（上线接口失败）/ `unknown`（平台新状态）/ `error`（读不到）。
+
+退出码：`0` 正常（含列表已空）；`1` 有读不到或上线失败的；`2` 没配 Cookie。
+
+判定优先级：**`pendingVersion.status` 先于 `asset.status`**。已上线资产再发新版时，
+`asset.status` 可能仍是 `published`，只看它会把在审版本判成已完成、提前收工。
+
+---
+
 ## audit —— 提交身份审计
 
 ```bash
@@ -274,9 +338,59 @@ $PY "$SR" publish <技能目录> [选项]
 | `--changelog STR` | 变更说明，送到平台审核侧 |
 | `--force` | 忽略阻断项（不建议） |
 | `--no-submit` | open.workbuddy 只上传不提交审核 |
+| `--pay {free,buyout,subscription,per_call}` | 收费方式，**按平台分家**：buyout 买断 / subscription 月订阅 = open.workbuddy（不填读 `workbuddy.pay_mode`）；per_call 按次调用 = SkillHub 付费 |
+| `--price 元` | 付费金额：buyout/subscription 是总价（元，内部按分提交）；per_call 是**单次调用价**（元/次，两位小数） |
+| `--pay-days N` | 订阅周期天数（仅 `--pay subscription`，默认 30） |
 | `--workdir DIR` | 暂存目录，默认 `~/.workbuddy/.release` |
 | `--json` | 结构化输出 |
 | `--quiet` / `-q` | 只输出结果行 |
+
+### 付费发布（`--pay` / `--price`）
+
+```bash
+$PY "$SR" publish <技能目录> --targets workbuddy --yes --pay buyout --price 29
+$PY "$SR" publish <技能目录> --targets workbuddy --yes --pay subscription --price 19 --pay-days 30
+$PY "$SR" publish <技能目录> --targets workbuddy --yes --pay free   # 覆盖配置里的付费值
+```
+
+等价地，把定档写进配置后，`publish` 什么都不用带：
+
+```bash
+$PY "$SR" creds --set workbuddy.pay_mode=1 --set workbuddy.pay_amount=29
+```
+
+命令行参数**优先于**配置（`--pay free` 可临时把收费技能发成免费）。
+
+真实载荷形状（错一个键就静默变免费，2026-10-26 实测）：
+
+```json
+"fields": {"common": {..., "payMode": 1,
+                      "payDetail": [{"price": 2900, "duration_days": 0}],
+                      "needEncrypt": true}}
+```
+
+三条平台约束：付费方式是**版本级**属性、**过审即锁死**、**免费资产不能转付费**。
+所以首次提交就要定对；要改只能在 `draft` / 待审阶段撤回重提。
+
+### SkillHub 付费发布（`--pay per_call`，1.5.6 起）
+
+```bash
+$PY "$SR" publish <技能目录> --targets skillhub --yes --pay per_call --price 0.10
+```
+
+- 2026-10-27 从官网 bundle 反解 + 实测：**个人可发布付费 Skill**（旧结论「个人跑不通」
+  已过时）。前置 = SkillPay 个人入驻（`GET /api/v1/aipay/status` → `onboarded:true`，
+  手机号验证码即可，无需营业执照）。`aipay_status()` 可查。
+- publish payload 增加 `pricing:{billingType:"per_call", pricingMode:"unified",
+  pricePerCall:"0.10", currency:"CNY"}`，展示区间 **0.01–100 元/次**。
+- **SkillHub 只有按次一种付费形态**（x402：调用 → 402 账单 → 支付宝 AI 按量付费 →
+  `Payment-Proof` 验付 → 交付）。**没有买断/订阅档** —— 想做捆绑买断，要在收费后端
+  里自己实现（首单收款后签发 license key，后续请求带 key 免 402）。
+- 提交前自动跑官方预检 `POST /api/v1/paid-skills/precheck`（上传 SKILL.md）。
+  **SKILL.md 必须描述真实 402 收费链路**（Payment-Needed / Payment-Proof 等词都要出现），
+  纯知识包过不了 —— 官方原话「不能仅凭文案声明替代真实可用的服务」。
+- `/api/v1/merchant/info` 是**企业商户**通道，个人账号 403 `ENTERPRISE_NOT_VERIFIED`
+  属正常，别误判成「个人不能付费」。
 
 ### 默认是演练
 

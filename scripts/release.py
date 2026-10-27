@@ -30,8 +30,9 @@ import creds                      # noqa: E402
 import frontmatter as fm_mod      # noqa: E402
 import pack                       # noqa: E402
 import rules                      # noqa: E402
+import watchlist                  # noqa: E402
 
-__version__ = "1.5.3"
+__version__ = "1.5.7"
 
 DEFAULT_WORKDIR = Path.home() / ".workbuddy" / ".release"
 VERSION_FILE = "VERSION.txt"
@@ -259,7 +260,8 @@ def do_github(skill: dict, staging: Path, cfg: dict, changelog: str,
 
 
 def do_skillhub(skill: dict, staging: Path, cfg: dict, changelog: str,
-                realize: bool, slug: str = "") -> dict:
+                realize: bool, slug: str = "",
+                price_per_call: float | None = None) -> dict:
     import pub_skillhub as sh
 
     sec = cfg.get("skillhub", {})
@@ -273,6 +275,48 @@ def do_skillhub(skill: dict, staging: Path, cfg: dict, changelog: str,
     if not (key or cookie):
         return {"target": "skillhub", "ok": False, "status": "skipped",
                 "message": "未配置 skillhub.key 或 skillhub.cookie，跳过 SkillHub"}
+    # 付费：命令行 --pay per_call --price X 优先；其次配置 skillhub.price_per_call。
+    # SkillHub 只有按次计费一种付费形态（x402），买断/订阅是 open.workbuddy 的档位。
+    if price_per_call is None:
+        cfg_price = sec.get("price_per_call")
+        try:
+            price_per_call = float(cfg_price) if cfg_price else None
+        except (TypeError, ValueError):
+            price_per_call = None
+    if price_per_call is not None:
+        if not 0.01 <= float(price_per_call) <= 100:
+            return {"target": "skillhub", "ok": False, "status": "error",
+                    "message": f"per_call 单价 {price_per_call} 越界：0.01–100 元/次"}
+        print(f"  SkillHub 付费发布：{price_per_call:.2f} 元/次（per_call）")
+        # 入驻前置检查：没入驻的账号发付费只会白挨一次 403
+        blockers: list[str] = []
+        try:
+            st = sh.aipay_status(host, token=key, cookie=cookie)
+            if not st.get("onboarded"):
+                blockers.append("SkillPay 未入驻（/api/v1/aipay/status onboarded=false）。"
+                                "先到商户中心完成「SkillPay 个人入驻」（手机号验证码）")
+        except sh.SkillHubError as exc:
+            print(f"  ⚠ 入驻状态查询失败（{exc}）")
+        # 官方 X402 预检：SKILL.md 必须描述真实 402 收费链路
+        try:
+            pc = sh.precheck_paid_skill(host, staging / "SKILL.md",
+                                        token=key, cookie=cookie)
+            compliance = str(pc.get("compliance") or "")
+            if compliance != "pass":
+                blockers.append(f"官方预检未过（compliance={compliance or 'unknown'}）："
+                                f"{json.dumps(pc, ensure_ascii=False)[:300]}。"
+                                "付费 Skill 需要真实 402 收费后端，纯知识包发不了")
+            else:
+                print("  官方预检：pass")
+        except sh.SkillHubError as exc:
+            print(f"  ⚠ 预检请求失败（{exc}）")
+        if blockers:
+            if realize:
+                return {"target": "skillhub", "ok": False, "status": "error",
+                        "message": "；".join(blockers)}
+            for b in blockers:
+                print(f"  ⚠ [演练，不阻断] {b}")
+            price_per_call = None    # 演练时降级为免费形态，只看不发
     # 图标：技能根目录 icon.png → skill-icons/upload → publish payload.iconUrl。
     # SkillHub 的 iconUrl **只能**在 publish 时带上（官网表单同一字段），
     # 漏了就会像 skill-release v1.4.3 那样在详情页裸奔。
@@ -286,7 +330,8 @@ def do_skillhub(skill: dict, staging: Path, cfg: dict, changelog: str,
                         "message": f"图标上传失败（不影响包本身）：{exc}"}
     try:
         res = sh.publish(host, key, staging, meta, changelog or "版本更新",
-                         dry_run=not realize, cookie=cookie)
+                         dry_run=not realize, cookie=cookie,
+                         price_per_call=price_per_call)
     except sh.SkillHubError as exc:
         return {"target": "skillhub", "ok": False, "status": "error",
                 "message": str(exc)}
@@ -298,13 +343,30 @@ def do_skillhub(skill: dict, staging: Path, cfg: dict, changelog: str,
 
 def do_workbuddy(skill: dict, staging: Path, cfg: dict, changelog: str,
                  realize: bool, workdir: Path, submit: bool,
-                 slug: str = "") -> dict:
+                 slug: str = "", pay_mode: int | None = None,
+                 pay_amount: float | None = None,
+                 pay_days: int | None = None) -> dict:
     import pub_workbuddy as wb
 
     sec = cfg.get("workbuddy", {})
     base = str(sec.get("base") or wb.DEFAULT_BASE)
     cookie = str(sec.get("cookie") or "").strip()
     _apply_wb_ua(sec)      # 会话绑定 UA，必须与取 Cookie 时那条请求一致
+
+    # 付费参数：命令行优先，其次配置，最后免费。金额对外用「元」，提交时换算成分。
+    if pay_mode is None:
+        pay_mode = int(sec.get("pay_mode") or 0)
+    if pay_amount is None:
+        pay_amount = float(sec.get("pay_amount") or 0)
+    if pay_days is None:
+        pay_days = int(sec.get("pay_days") or 0)
+    pay_mode = int(pay_mode or 0)
+    pay_cents = int(round(float(pay_amount or 0) * 100))
+    if pay_mode and pay_cents <= 0:
+        return {"target": "workbuddy", "ok": False, "status": "error",
+                "message": "设了付费却没给价格（--price，单位：元）"}
+    if pay_mode == 2 and not pay_days:
+        pay_days = 30       # 月订阅的默认周期
 
     slug = slug or skill["slug"]
     version = str(skill["fm"].get("version") or "").strip()
@@ -340,19 +402,42 @@ def do_workbuddy(skill: dict, staging: Path, cfg: dict, changelog: str,
             base, cookie, zip_path,
             name=slug,
             cover_object_key=cover_key,
-            categories=sec.get("categories") or None,
-            market_categories=sec.get("market_categories") or None,
+            categories=_as_list(sec.get("categories")),
+            market_categories=_as_list(sec.get("market_categories")),
             party_id=str(sec.get("party_id") or ""),
             enterprise_id=str(sec.get("enterprise_id") or ""),
             changelog=changelog, submit=submit, dry_run=not realize,
-            pay_mode=int(sec.get("pay_mode") or 0),
-            pay_amount=int(round(float(sec.get("pay_amount") or 0) * 100)),
-            pay_days=int(sec.get("pay_days") or 0))
+            pay_mode=pay_mode, pay_amount=pay_cents, pay_days=pay_days)
     except wb.WorkBuddyError as exc:
         return {"target": "workbuddy", "ok": False, "status": "error",
                 "zip": str(zip_path), "message": str(exc)}
     res["target"] = "workbuddy"
     res["zip"] = str(zip_path)
+
+    # 提交成功就把资产登记进巡航列表 —— 这是「发完就不用管」的关键一步。
+    # 资产状态机是 draft → under_review → approved → published，
+    # 过审之后**还要再点一次发布**才真正上架；这一步人一定会忘（实测忘过）。
+    # 登记之后 `watch --check --ship` 每天扫一遍，过审就自动上线。
+    if res.get("status") == "submitted" and res.get("asset_id"):
+        try:
+            watchlist.add({
+                "assetId": res["asset_id"],
+                "name": slug,
+                "version": version,
+                "versionId": res.get("version_id"),
+                "payMode": pay_mode,
+                "price": round(pay_cents / 100, 2) if pay_mode else 0,
+                "payDays": pay_days if pay_mode == 2 else 0,
+                "dir": str(skill["dir"]),
+                "changelog": changelog,
+                "target": "workbuddy",
+                "lastStatus": "under_review",
+                "action": "waiting",
+            }, workdir)
+            res["watched"] = True
+        except (OSError, ValueError):
+            # 巡航登记失败不该让「已经提交成功」这件事看起来像失败
+            res["watched"] = False
     return res
 
 
@@ -381,6 +466,47 @@ def cmd_check(args) -> int:
                 "；技术类技能一般填 [\"tools:office\"]（工具-办公）；"
                 "同时建议配 market_categories（如 [\"development-tools\"]）",
             ))
+        # 付费配置自检：付费是版本级属性、过审即锁死、免费资产不能转付费，
+        # 所以「打算收费却配置不完整」必须在提交前拦下，而不是等驳回后再撤回。
+        pm = int(sec.get("pay_mode") or 0)
+        if pm not in (0, 1, 2):
+            findings.append(rules.Finding(
+                "error", "workbuddy", "bad-pay-mode",
+                f"workbuddy.pay_mode={pm} 非法，只能是 0免费 / 1买断 / 2订阅",
+                "verified", "改配置：release.py creds --set workbuddy.pay_mode=1"))
+        elif pm and float(sec.get("pay_amount") or 0) <= 0:
+            findings.append(rules.Finding(
+                "error", "workbuddy", "pay-without-price",
+                "配置了付费方式但 workbuddy.pay_amount 为空（单位：元）",
+                "verified",
+                "补价格：release.py creds --set workbuddy.pay_amount=29；"
+                "或发布时用 --pay buyout --price 29"))
+        elif pm == 2 and not int(sec.get("pay_days") or 0):
+            findings.append(rules.Finding(
+                "warn", "workbuddy", "sub-without-days",
+                "配置了月订阅但没写 workbuddy.pay_days，提交时会默认 30 天",
+                "verified", "如需自定义周期：creds --set workbuddy.pay_days=30"))
+        # 收入天花板门槛：付费资产在提交前必须能算出「值得做」的理由。
+        # 2026-10-27 launch-guard 事故 → 这条从「事后复盘文字」变成「提交前阻塞项」。
+        if pm:
+            price = float(sec.get("pay_amount") or 0)
+            aud = sec.get("audience")
+            if aud in (None, ""):
+                findings.append(rules.Finding(
+                    "warn", "workbuddy", "pay-no-audience",
+                    "付费发布但没提供可触达人群估算，无法验证是否值得做",
+                    "verified",
+                    "先看同类免费资产的安装量：release.py metrics --days 90；"
+                    "再 creds --set workbuddy.audience=<人数>。"
+                    "天花板 = 人群 × 10% × 价格，低于 ¥300 就别做"))
+            else:
+                rc = rules.revenue_ceiling(int(aud), price)
+                findings.append(rules.Finding(
+                    "info" if rc["pass"] else "warn",
+                    "workbuddy", "pay-ceiling",
+                    rc["verdict"], "verified",
+                    "这只是估算（转化率按 10% 拍的）。人群要取「已证明会装这类东西的人」，"
+                    "不是全平台用户数。要不要做你定 —— 拿它当参考，别当判决"))
     if want_json(args):
         print(json.dumps({
             "skill": skill["slug"], "version": skill["version"], "dir": str(skill["dir"]),
@@ -579,6 +705,68 @@ def cmd_withdraw(args) -> int:
     return 0
 
 
+def cmd_pay(args) -> int:
+    """只读回看某个资产的付费状态（发布前定档 / 发布后核验都用它）。
+
+    存在的意义：付费方式是**版本级**属性，过审即锁死、免费资产不能转付费，
+    而且「界面上显示 29 元」不代表服务端记的是 29 元 —— 2026-10-26 实测过
+    控制台弹窗只是前端状态、submit 载荷没带上就静默变免费。所以宁可多问一句
+    服务端，也不要在驳回/上线后才发现定错了价。
+    """
+    import pub_workbuddy as wb
+
+    cfg = creds.load()
+    sec = cfg.get("workbuddy", {})
+    cookie = str(sec.get("cookie") or "").strip()
+    if not cookie:
+        print("没有 Cookie。先执行：skill-release login 或 creds --set workbuddy.cookie=<值>",
+              file=sys.stderr)
+        return 2
+    _apply_wb_ua(sec)
+    base = str(sec.get("base") or wb.DEFAULT_BASE)
+    party = str(sec.get("party_id") or "")
+    ent = str(sec.get("enterprise_id") or "")
+
+    target = str(getattr(args, "target", "") or "").strip()
+    asset_id = target if target.startswith("os_") else ""
+    if not asset_id:
+        name = str(getattr(args, "name", "") or "").strip()
+        if not name:
+            try:
+                name = load_skill(Path(target or "."))["slug"]
+            except Exception:
+                name = ""
+        if not name:
+            print("给一个 assetId（os_...）、技能目录或 --name。", file=sys.stderr)
+            return 2
+        asset = wb.find_asset(base, cookie, name, party, ent)
+        if not asset:
+            print(f"没找到名为「{name}」的资产", file=sys.stderr)
+            return 1
+        asset_id = str(asset.get("assetId") or "")
+    try:
+        st = wb.pay_state(base, cookie, asset_id, party_id=party, enterprise_id=ent)
+    except wb.WorkBuddyError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    if want_json(args):
+        print(json.dumps(st, ensure_ascii=False, indent=2))
+    else:
+        price = ""
+        if st["prices"] and st["pay_mode"] == 1:
+            price = f" ¥{st['prices'][0]:g}"
+        elif st["prices"] and st["pay_mode"] == 2:
+            price = f" ¥{st['prices'][0]:g}/{st['days'][0] if st['days'] else '?'} 天"
+        print(f"资产 {st['asset_id']}")
+        print(f"  状态      ：{st['status']}（版本 {st['version'] or '-'} / {st['version_status'] or '-'}）")
+        print(f"  付费方式  ：{st['pay_mode_label']}{price}")
+        print(f"  原始字段  ：{json.dumps(st['pay_detail'], ensure_ascii=False)}")
+        if st["pay_mode"] == 0:
+            print("  提示      ：当前是免费。付费只能在 submit 时带上，且过审后不可改。")
+    return 0
+
+
 def _playwright_python() -> str:
     """找装了 playwright 的解释器。
 
@@ -604,7 +792,9 @@ def cmd_login(args) -> int:
     """
     import subprocess
 
-    script = Path(__file__).resolve().parent / "login_workbuddy.py"
+    target = getattr(args, "target", "workbuddy") or "workbuddy"
+    script = _HERE / ("login_skillhub.py" if target == "skillhub"
+                      else "login_workbuddy.py")
     if not script.is_file():
         print(f"缺少登录脚本：{script}", file=sys.stderr)
         return 2
@@ -620,12 +810,248 @@ def cmd_login(args) -> int:
     cmd = [py, str(script)]
     if getattr(args, "check_only", False):
         cmd.append("--check-only")
+    elif getattr(args, "refresh", False):
+        # 只对 workbuddy 有意义：把活着的浏览器 profile 会话重新导回配置
+        cmd.append("--refresh")
     else:
         cmd += ["--timeout", str(int(getattr(args, "timeout", 300) or 300))]
         if getattr(args, "fresh", False):
             cmd.append("--fresh")
 
     return subprocess.call(cmd)
+
+
+def cmd_ship(args) -> int:
+    """把「过审待发布」的资产全部上线 —— 过审 ≠ 上线，中间还隔一个发布按钮。
+
+    资产状态机里有 `approved`（过审待发布）与 `published`（已上线）两态；
+    长期不登控制台的话，过审的版本就会一直卡在前者。本命令扫一遍资产列表，
+    把所有 approved 的直接调发布接口上线，平时挂自动化跑，人就不用记了。
+    """
+    import pub_workbuddy as wb
+
+    cfg = creds.load()
+    sec = cfg.get("workbuddy", {})
+    cookie = str(sec.get("cookie") or "").strip()
+    if not cookie:
+        print("没有 Cookie。先执行：release.py login（扫码）", file=sys.stderr)
+        return 2
+    _apply_wb_ua(sec)
+    base = str(sec.get("base") or wb.DEFAULT_BASE)
+    party = str(sec.get("party_id") or "")
+    ent = str(sec.get("enterprise_id") or "")
+
+    try:
+        pending = wb.pending_release(base, cookie, party_id=party, enterprise_id=ent)
+    except wb.WorkBuddyError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    if not pending:
+        print("没有过审待发布的资产，全部在线 ✓")
+        return 0
+    print(f"过审待发布 {len(pending)} 个：")
+    for it in pending:
+        print(f"  - {it['name']}  {it.get('version') or '?'}  ({it['asset_id']})")
+    if args.dry_run or not args.yes:
+        print("[演练] 未真正发布。确认无误后加 --yes 执行。")
+        return 0
+
+    failed = 0
+    for it in pending:
+        try:
+            res = wb.publish_asset(base, cookie, it["asset_id"],
+                                   visible_scope=[args.scope],
+                                   party_id=party, enterprise_id=ent)
+            print(f"  ✓ {it['name']}: {res['message']}")
+        except wb.WorkBuddyError as exc:
+            failed += 1
+            print(f"  ✗ {it['name']}: {exc}", file=sys.stderr)
+    if failed:
+        print(f"{failed} 个发布失败，见上方报错", file=sys.stderr)
+        return 1
+    print(f"全部上线完成（{len(pending)} 个）")
+    return 0
+
+
+def cmd_watch(args) -> int:
+    """审核巡航：把「等审核」这件事从人脑里挪到列表里。
+
+    三种用法：
+      watch                  看列表（谁在等、等多久、查过几次）
+      watch --check --ship   跑一次巡检，过审的自动上线，落地的自动出列
+      watch --stop           停止巡航（清空列表）
+
+    **为什么要有 --ship**：过审（approved）不等于上线（published），
+    中间还隔着一次「发布」调用。大家都以为审核通过就完事了，于是资产
+    在 approved 状态里躺到下次想起来为止 —— 这才是最常亏的一段时间。
+
+    **为什么列表空了就算「巡航结束」**：列表只装「在等结果」的资产。
+    被驳回、被撤回、已上线都不需要再等，出列即完结。所以
+    `--json` 输出里 `done: true` 就是自动化任务停掉自己的信号。
+    """
+    import pub_workbuddy as wb
+
+    workdir = Path(opt(args, "workdir") or DEFAULT_WORKDIR).expanduser()
+    json_out = want_json(args)
+    quiet = bool(opt(args, "quiet", False))
+
+    # ---- 停止巡航
+    if args.stop:
+        if args.asset:
+            ok = watchlist.remove(args.asset, workdir)
+            if json_out:
+                print(json.dumps({"stopped": ok, "assetId": args.asset},
+                                 ensure_ascii=False))
+            else:
+                print(f"{'已移出巡航' if ok else '列表里没有这个资产'}：{args.asset}")
+            return 0
+        n = watchlist.clear(workdir)
+        if json_out:
+            print(json.dumps({"stopped": True, "removed": n}, ensure_ascii=False))
+        else:
+            print(f"巡航已停止，清空 {n} 个待审登记" if n else "巡航列表本来就是空的")
+        return 0
+
+    data = watchlist.load(workdir)
+    items = data["items"]
+    if args.asset:
+        items = [it for it in items if it.get("assetId") == args.asset]
+
+    # ---- 只看列表
+    if not args.check:
+        if json_out:
+            print(json.dumps({"items": items, "summary": watchlist.summary(items)},
+                             ensure_ascii=False, indent=2))
+            return 0
+        if not items:
+            print("巡航列表为空 —— 没有在等的资产（发版时会自动登记）")
+            return 0
+        print(f"待审 {len(items)} 个：")
+        for it in items:
+            pay = (f"¥{it.get('price')} 买断" if int(it.get("payMode") or 0) == 1
+                   else f"¥{it.get('price')}/月" if int(it.get("payMode") or 0) == 2
+                   else "免费")
+            print(f"  {it.get('assetId')}  {str(it.get('name') or ''):<22}"
+                  f"v{str(it.get('version') or '?'):<8}{pay:<12}"
+                  f"{str(it.get('lastStatus') or '?'):<13}"
+                  f"查过 {int(it.get('checks') or 0)} 次")
+            if it.get("lastCheckedAt"):
+                print(f"      上次检查 {it['lastCheckedAt']}")
+        print("\n巡检一次：release.py watch --check --ship")
+        return 0
+
+    # ---- 巡检
+    if not items:
+        if json_out:
+            print(json.dumps({"checked": 0, "results": [],
+                              "summary": watchlist.summary([]), "done": True},
+                             ensure_ascii=False))
+        else:
+            print("巡航列表为空，无需巡检 ✓")
+        return 0
+
+    cfg = creds.load()
+    sec = cfg.get("workbuddy", {})
+    cookie = str(sec.get("cookie") or "").strip()
+    if not cookie:
+        print("没有 Cookie。先执行：release.py login（扫码）", file=sys.stderr)
+        return 2
+    _apply_wb_ua(sec)
+    base = str(sec.get("base") or wb.DEFAULT_BASE)
+    party = str(sec.get("party_id") or "")
+    ent = str(sec.get("enterprise_id") or "")
+
+    results: list[dict] = []
+    remaining: list[str] = []
+    for it in items:
+        aid = str(it["assetId"])
+        row = {"assetId": aid, "name": it.get("name"),
+               "version": it.get("version"), "payMode": int(it.get("payMode") or 0),
+               "price": it.get("price")}
+        try:
+            st = wb.review_state(base, cookie, aid, party_id=party, enterprise_id=ent)
+        except wb.WorkBuddyError as exc:
+            msg = str(exc)
+            row.update({"action": "error", "message": msg})
+            results.append(row)
+            remaining.append(aid)
+            # 会话失效是全局问题，后面几条也必然失败，直接中断更省事
+            if "会话失效" in msg or "403" in msg:
+                break
+            continue
+
+        row["remote_status"] = st["status"]
+        row["remote_version"] = st["version"]
+        row["pending_status"] = st["pending"]["status"]
+        row["current_version"] = st["current"]["version"]
+        action = watchlist.classify(st["status"], st["pending"]["status"],
+                                    st["current"]["status"])
+        row["action"] = action
+
+        if action == "ship":
+            if not args.ship:
+                row["note"] = "已过审待上线（加 --ship 自动发）"
+                remaining.append(aid)
+            else:
+                try:
+                    r = wb.publish_asset(base, cookie, aid,
+                                         visible_scope=[args.scope],
+                                         party_id=party, enterprise_id=ent)
+                    row["action"] = "shipped"
+                    row["note"] = r["message"]
+                except wb.WorkBuddyError as exc:
+                    row["action"] = "ship_failed"
+                    row["note"] = str(exc)
+                    remaining.append(aid)
+        elif action in watchlist.RESOLVED:
+            if action == "rejected":
+                row["note"] = (st["pending"]["reject_reason"]
+                               or st["current"]["reject_reason"]
+                               or "被驳回，原文见控制台")
+        else:
+            # waiting / unknown：留在列表里
+            remaining.append(aid)
+            if action == "unknown":
+                row["note"] = f"状态无法识别：{st['status']!r}，请人工看一眼"
+
+        results.append(row)
+        watchlist.touch(aid, status=st["status"], workdir=workdir)
+
+    # 出列：已落地的不必再等
+    for row in results:
+        if row.get("action") in ("shipped", "done", "rejected", "withdrawn"):
+            watchlist.remove(row["assetId"], workdir)
+
+    left = [it for it in watchlist.load(workdir)["items"]]
+    done = not left
+
+    if json_out:
+        print(json.dumps({"checked": len(results), "results": results,
+                          "remaining": left,
+                          "summary": watchlist.summary(left),
+                          "done": done}, ensure_ascii=False, indent=2))
+        return 0
+
+    mark = {"shipped": "✓ 已上线", "done": "✓ 已在线", "waiting": "… 审核中",
+            "rejected": "✗ 被驳回", "withdrawn": "✗ 已撤回",
+            "ship_failed": "✗ 上线失败", "unknown": "? 状态未知",
+            "error": "✗ 读不到"}
+    if not quiet:
+        print(f"巡航巡检（{len(results)} 个）")
+    for row in results:
+        label = mark.get(row.get("action"), row.get("action"))
+        ver = row.get("remote_version") or row.get("version") or "?"
+        print(f"  {label:<10}{str(row.get('name') or ''):<22}v{ver}")
+        if row.get("note"):
+            print(f"      {row['note']}")
+    print("")
+    if done:
+        print("全部落地，巡航列表已清空 —— 可以停止巡航了 ✓")
+    else:
+        print(f"仍有 {len(left)} 个待审，巡航继续")
+    bad = [r for r in results if r.get("action") in ("error", "ship_failed")]
+    return 1 if bad else 0
 
 
 def cmd_probe(args) -> int:
@@ -673,6 +1099,26 @@ def cmd_metrics(args) -> int:
     return subprocess.call(cmd)
 
 
+def _as_list(v):
+    """creds 里 JSON 数组经常以字符串形态存进来（--set categories=["a"] 落盘成字符串）。
+
+    直接把字符串塞进 fields.common.categories 会触发平台端「逐字符遍历」——
+    2026-10-26 实测把 '["tools:office"]' 拆成了 16 个单字符 categoryId（乱码类目），
+    且类目字段 update 端点只读、改不回来，只能重传包修复。这里必须在出口处转成真数组。
+    """
+    if v is None or v == "":
+        return None
+    if isinstance(v, list):
+        return v
+    if isinstance(v, str):
+        try:
+            parsed = json.loads(v)
+            return parsed if isinstance(parsed, list) else [v]
+        except (ValueError, TypeError):
+            return [x.strip() for x in v.split(",") if x.strip()]
+    return [v]
+
+
 def cmd_publish(args) -> int:
     skill = load_skill(Path(args.skill))
     targets = tuple(args.targets)
@@ -710,16 +1156,87 @@ def cmd_publish(args) -> int:
     if not quiet:
         print(f"暂存目录：{workdir / slugs[targets[0]]}")
 
+    # 付费：命令行 > 配置。--pay free 可显式覆盖配置里的付费值（做免费版时很有用）。
+    # 档位按平台分家（2026-10-27）：
+    #   workbuddy：buyout 买断 / subscription 订阅（版本级、过审锁死）
+    #   skillhub ：per_call 按次调用（x402，0.01–100 元/次，需 SkillPay 入驻 + 收费后端）
+    pay_mode = getattr(args, "pay", None)
+    pay_map = {"free": 0, "buyout": 1, "subscription": 2}
+    price = getattr(args, "price", None)
+    sh_price_per_call: float | None = None
+    if pay_mode == "per_call":
+        if "skillhub" not in targets:
+            print("--pay per_call 只对 SkillHub 生效，本次目标里没有 skillhub。",
+                  file=sys.stderr)
+            return 1
+        if not price:
+            print("付费发布必须给 --price（单位：元/次，如 --price 0.10）。", file=sys.stderr)
+            return 1
+        sh_price_per_call = float(price)
+        pay_mode = 0          # wb 侧不带付费档
+    else:
+        if pay_mode is not None:
+            pay_mode = pay_map[pay_mode] if isinstance(pay_mode, str) else int(pay_mode)
+        if pay_mode and not price:
+            print("付费发布必须给 --price（单位：元，如 --price 29）。", file=sys.stderr)
+            return 1
+        if pay_mode == 2 and not args.pay_days:
+            print("订阅请给 --pay-days（周期天数，如 30）。", file=sys.stderr)
+            return 1
+        if pay_mode and "workbuddy" not in targets:
+            print("提示：buyout/subscription 只对 open.workbuddy 生效，"
+                  "本次目标里没有 workbuddy。", file=sys.stderr)
+        if pay_mode and "skillhub" in targets:
+            print("提示：SkillHub 没有买断/订阅档（只有 per_call 按次），"
+                  "本次 SkillHub 仍按免费发布。", file=sys.stderr)
+
+    # 收入天花板：**摆在台面上，不替人做决定**。
+    #
+    # 2026-10-27 的教训是「根本没算就做完了整套」，所以要算。
+    # 但「算出来 ¥26 所以别做」是我的处境（一天工钱 ¥300），不是所有人的标准：
+    # 别人可能外站有粉丝、或只是想立个价格锚、或用付费筛人。
+    # 通用工具一旦替人做价值判断，就和这次犯的错同源 —— 拿自己的处境当别人的标准。
+    # 所以：给了 --audience 就把算式和结论打出来；不给就提一句；只有显式 --strict 才拦。
+    audience = getattr(args, "audience", None)
+    if audience in (None, ""):
+        audience = (cfg.get("workbuddy") or {}).get("audience")
+    strict = bool(getattr(args, "strict", False)) or bool(
+        (cfg.get("workbuddy") or {}).get("strict_ceiling"))
+    if pay_mode:
+        if audience in (None, "", 0):
+            msg = ("提示：未提供 --audience，跳过收入天花板估算。\n"
+                   "  想知道值不值得做，先看同类免费资产的安装量：\n"
+                   "    release.py metrics --days 90\n"
+                   "  再带上人群数：--audience 9（天花板 = 人群 × 转化率 × 价格）")
+            if strict:
+                print("\n--strict 模式下必须给 --audience。\n" + msg, file=sys.stderr)
+                return 1
+            print(msg, file=sys.stderr)
+        else:
+            rc = rules.revenue_ceiling(int(audience), args.price or 0)
+            mark = "✓" if rc["pass"] else "!"
+            print(f"\n{mark} 收入天花板：{rc['verdict']}", file=sys.stderr)
+            if not rc["pass"]:
+                if strict:
+                    print("  --strict 模式下不过线不提交。要去掉 --strict 或调高人群/价格估算。",
+                          file=sys.stderr)
+                    return 1
+                print("  这只是估算（转化率按 10% 拍的），要不要做你定；"
+                      "加 --strict 可让工具替你拦。", file=sys.stderr)
+
     results: list[dict] = []
     for t in targets:
         st = staging[t]
         if t == "github":
             r = do_github(skill, st, cfg, changelog, realize, slugs["github"])
         elif t == "skillhub":
-            r = do_skillhub(skill, st, cfg, changelog, realize, slugs["skillhub"])
+            r = do_skillhub(skill, st, cfg, changelog, realize, slugs["skillhub"],
+                            price_per_call=sh_price_per_call)
         elif t == "workbuddy":
             r = do_workbuddy(skill, st, cfg, changelog, realize, workdir,
-                             submit=not args.no_submit, slug=slugs["workbuddy"])
+                             submit=not args.no_submit, slug=slugs["workbuddy"],
+                             pay_mode=pay_mode, pay_amount=args.price,
+                             pay_days=args.pay_days)
         else:
             r = {"target": t, "ok": False, "status": "unknown",
                  "message": f"未知目标 {t}"}
@@ -740,6 +1257,15 @@ def cmd_publish(args) -> int:
                 print(f"      {r['url']}")
             if r.get("zip"):
                 print(f"      包：{r['zip']}")
+
+    # 提交成功就明说下一步，否则「登记了但没人开巡航」等于没登记
+    watched = [r for r in results if r.get("watched")]
+    if watched and not want_json(args):
+        names = "、".join(str(r.get("name") or r.get("asset_id") or "?") for r in watched)
+        print("")
+        print(f"已登记进巡航（{len(watched)} 个：{names}）—— release.py watch 可查看")
+        print("把「技能审核巡航（过审自动上线，落地自停）」任务置为 ACTIVE，"
+              "就会每天盯到上线，全部落地后它自己暂停")
 
     bad = [r for r in results if not r.get("ok")]
     if not bad:
@@ -837,9 +1363,13 @@ def build_parser() -> argparse.ArgumentParser:
     mt.set_defaults(func=cmd_metrics)
 
     lg = sub.add_parser("login",
-                        help="扫码登录 open.workbuddy（会自动抓 Cookie 与 UA，不用导 HAR）")
-    lg.add_argument("--timeout", type=int, default=300, help="等待扫码的秒数，默认 300")
+                        help="浏览器登录（workbuddy 扫码 / skillhub 手动登录），自动抓 Cookie，不用导 HAR")
+    lg.add_argument("--target", choices=["workbuddy", "skillhub"], default="workbuddy",
+                    help="登录哪个平台，默认 workbuddy（扫码）；skillhub 为手动登录后自动收尾")
+    lg.add_argument("--timeout", type=int, default=300, help="等待扫码/登录的秒数，默认 300")
     lg.add_argument("--check-only", action="store_true", help="只验活，不打开浏览器")
+    lg.add_argument("--refresh", action="store_true",
+                    help="不开窗口：从浏览器 profile 里把当前有效会话重新导出（cookie 过期但 profile 还活着时用）")
     lg.add_argument("--fresh", action="store_true", help="清空旧浏览器 profile 再登录")
     add_common(lg, "sub")
     lg.set_defaults(func=cmd_login)
@@ -853,6 +1383,36 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(wd, "sub")
     wd.set_defaults(func=cmd_withdraw)
 
+    pyp = sub.add_parser("pay",
+                         help="回看某资产的付费状态（免费/买断/订阅 + 金额），只读")
+    pyp.add_argument("target", nargs="?", default=".",
+                     help="技能目录，或直接给 assetId（os_...）")
+    pyp.add_argument("--name", help="按技能名找资产时覆盖名字（默认取 frontmatter 的 slug/name）")
+    add_common(pyp, "sub")
+    pyp.set_defaults(func=cmd_pay)
+
+    sh = sub.add_parser("ship",
+                        help="把所有「过审待发布」(approved) 的资产一键上线 —— 解决过审后忘点发布按钮")
+    sh.add_argument("--dry-run", action="store_true", help="只列出待发布资产，不真发布")
+    sh.add_argument("--scope", default="ALL", choices=["ALL", "BUDDY_APP_ONLY"],
+                    help="visibleScope，个人主体只能 ALL（默认）")
+    add_common(sh, "sub")
+    sh.set_defaults(func=cmd_ship)
+
+    wt = sub.add_parser("watch",
+                        help="审核巡航：发布后自动登记，过审自动上线，全部落地即结束")
+    wt.add_argument("--check", action="store_true",
+                    help="跑一次巡检（不加则只列出待审列表）")
+    wt.add_argument("--ship", action="store_true",
+                    help="巡检时把「已过审」(approved) 的自动上线")
+    wt.add_argument("--stop", action="store_true", help="停止巡航（清空待审登记）")
+    wt.add_argument("--asset", metavar="ID",
+                    help="只针对某个 assetId（配合 --check / --stop）")
+    wt.add_argument("--scope", default="ALL", choices=["ALL", "BUDDY_APP_ONLY"],
+                    help="自动上线时的 visibleScope，个人主体只能 ALL（默认）")
+    add_common(wt, "sub")
+    wt.set_defaults(func=cmd_watch)
+
     pub = sub.add_parser("publish", help="发布（默认演练，加 --yes 才真发）")
     pub.add_argument("skill", nargs="?", default=".")
     pub.add_argument("--targets", default=",".join(rules.PLATFORMS),
@@ -864,6 +1424,23 @@ def build_parser() -> argparse.ArgumentParser:
     pub.add_argument("--dry-run", action="store_true", help="强制演练")
     pub.add_argument("--no-submit", action="store_true",
                      help="open.workbuddy 只上传不提交审核")
+    pub.add_argument("--pay", choices=("free", "buyout", "subscription", "per_call"),
+                     help="付费方式（按平台分家）：buyout 一次性买断 / subscription 月订阅"
+                          "（open.workbuddy，版本级、过审锁死）；per_call 按次调用"
+                          "（SkillHub，0.01–100 元/次，需 SkillPay 入驻 + 真实 402 收费后端）。"
+                          "不填 buyout/subscription 则读配置 workbuddy.pay_mode")
+    pub.add_argument("--price", type=float, metavar="元",
+                     help="付费金额：buyout/subscription 是总价（元），per_call 是单次调用价"
+                          "（元/次，两位小数）")
+    pub.add_argument("--pay-days", type=int, metavar="N",
+                     help="订阅周期天数（仅 --pay subscription，默认 30）")
+    pub.add_argument("--audience", type=int, metavar="N",
+                     help="可触达人群估算（可选）。取「已证明会装这类东西的人」，"
+                          "例如同类免费资产的安装量，不是全平台用户数。"
+                          "给了就按 人群 × 10%% × 价格 打印天花板估算")
+    pub.add_argument("--strict", action="store_true",
+                     help="开启硬门槛：付费发布时必须给 --audience，且天花板低于 ¥300 就拒绝提交。"
+                          "默认只提示不拦 —— ¥300 是价值判断，不该由工具替所有人定")
     add_common(pub, "sub")
     pub.set_defaults(func=cmd_publish)
 

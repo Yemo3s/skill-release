@@ -375,6 +375,50 @@ def _semver_ok(ver: str) -> bool:
     return bool(SEMVER_RE.match(ver))
 
 
+# 付费发布前的收入天花板门槛。2026-10-27 事故沉淀：
+# launch-guard（¥29，教人上架技能）在「可触达人群 9 人」的前提下就被做完了整套，
+# 真实天花板 9 × 10% × 29 ≈ ¥26 —— 一天工钱都不到。问题不是定价错了，是**根本没算**。
+# 所以把算式变成阻塞项：算得出且过线才允许发付费。
+CEILING_FLOOR = 300.0      # 元。低于它就是「不值得做」，不是「先试试」。
+CEILING_CONVERSION = 0.10  # 保守转化率：付费工具在内测期按 10% 估已经算乐观
+
+
+def revenue_ceiling(audience: int, price: float,
+                    rate: float = CEILING_CONVERSION) -> dict:
+    """付费资产的天花板估算。
+
+    `audience` 是**已经证明会装这类东西的人**（不是全平台用户）——
+    取值必须来自真实装机数据，例如同类免费资产的安装量。
+    `price` 单位是元（买断价，或订阅的月价）。
+
+    返回 dict：
+      audience / price / rate / ceiling（元）/ floor / pass（bool）/ verdict
+    这不是预测收入，是**排除明显不该做的东西**。算出来过线也不代表能卖出去。
+    """
+    try:
+        aud = max(0, int(audience))
+    except (TypeError, ValueError):
+        aud = 0
+    try:
+        pr = max(0.0, float(price))
+    except (TypeError, ValueError):
+        pr = 0.0
+    ceiling = round(aud * float(rate) * pr, 2)
+    ok = ceiling >= CEILING_FLOOR and aud > 0 and pr > 0
+    if aud <= 0:
+        verdict = "没有可触达人群 → 不该做"
+    elif pr <= 0:
+        verdict = "没定价 → 不算付费资产"
+    elif ok:
+        verdict = f"天花板 ¥{ceiling:.0f}，过线（≥ ¥{CEILING_FLOOR:.0f}）"
+    else:
+        verdict = (f"天花板 {aud} × {rate:.0%} × ¥{pr:g} = ¥{ceiling:.0f}，"
+                   f"低于 ¥{CEILING_FLOOR:.0f} → 不该做")
+    return {"audience": aud, "price": pr, "rate": float(rate),
+            "ceiling": ceiling, "floor": CEILING_FLOOR,
+            "pass": ok, "verdict": verdict}
+
+
 def effective_frontmatter(fm: dict, platform: str,
                           author: str = "", slug_override: str = "") -> tuple[dict, dict]:
     """算出「投影到临时副本之后」该平台实际看到的 frontmatter。

@@ -39,7 +39,13 @@ ENV_MAP = {
 _EMPTY: dict = {
     "skillhub": {"key": "", "cookie": "", "host": "https://api.skillhub.cn"},
     "workbuddy": {"cookie": "", "base": "https://open.workbuddy.cn",
-                  "party_id": "", "enterprise_id": ""},
+                  "party_id": "", "enterprise_id": "",
+                  # 付费发布：pay_mode 0=免费 1=买断 2=订阅；pay_amount 单位是**元**
+                  # （内部提交时换算成分）；pay_days 仅订阅用。付费方式是版本级
+                  # 属性、过审即锁死，所以这些值一旦定下就别随手改。
+                  # audience = 可触达人群估算（付费前必填，见 rules.revenue_ceiling）
+                  "pay_mode": 0, "pay_amount": 0, "pay_days": 0,
+                  "audience": 0},
     "github": {"owner": "", "private": True},
     "author": "",
 }
@@ -92,8 +98,34 @@ def save(data: dict, path: Path | None = None) -> Path:
     return p
 
 
+def _maybe_json(value):
+    """把 JSON 数组/对象字面量解析成真结构，其余原样返回。
+
+    为什么需要：`--set categories=["tools:office"]` 命令行拿到的永远只是字符串。
+    若原样落盘，提交时平台会把它当**可迭代字符串**逐字符遍历 ——
+    `['[', '"', 't', 'o', 'o', 'l', 's', ':', ...]` 变成 16 个单字符类目，
+    而类目字段没有任何 update 端点，只能重新发一整版才能改回来。
+    2026-10-26 就这么废掉过一版 1.5.3。所以入口处就解析成真数组。
+    """
+    if not isinstance(value, str):
+        return value
+    s = value.strip()
+    if not s or s[0] not in "[{":
+        return value
+    try:
+        parsed = json.loads(s)
+    except (ValueError, TypeError):
+        return value
+    return parsed if isinstance(parsed, (list, dict)) else value
+
+
 def set_value(dotted: str, value: str, path: Path | None = None) -> Path:
-    """按 `skillhub.key` 这样的点号路径写入单个值。"""
+    """按 `skillhub.key` 这样的点号路径写入单个值。
+
+    值是 JSON 字面量时（`--set workbuddy.categories=["tools:office"]`）
+    会解析成真数组再落盘，见 `_maybe_json()`。
+    """
+    value = _maybe_json(value)
     data = load(path)
     if "." in dotted:
         head, tail = dotted.split(".", 1)
@@ -131,6 +163,22 @@ def describe(path: Path | None = None) -> str:
     lines.append(f"  workbuddy.user_agent：{wb.get('user_agent') or '(未设，用兜底 UA)'}")
     lines.append(f"  workbuddy.party_id  ：{wb.get('party_id') or '(未设)'}")
     lines.append(f"  workbuddy.base   ：{wb.get('base', '')}")
+    mode = int(wb.get("pay_mode") or 0)
+    mode_txt = {0: "免费", 1: "一次性买断", 2: "月订阅"}.get(mode, f"未知({mode})")
+    amount = wb.get("pay_amount") or 0
+    lines.append(f"  workbuddy.pay    ：{mode_txt}"
+                 + (f" ¥{amount}" if mode == 1 else "")
+                 + (f" ¥{amount}/{wb.get('pay_days') or '?'} 天" if mode == 2 else ""))
+    aud = int(wb.get("audience") or 0)
+    if mode:
+        try:
+            import rules as _rules
+            rc = _rules.revenue_ceiling(aud, amount)
+            lines.append(f"  workbuddy.audience：{aud or '(未设)'}  →  {rc['verdict']}")
+        except Exception:
+            lines.append(f"  workbuddy.audience：{aud or '(未设)'}")
+    else:
+        lines.append(f"  workbuddy.audience：{aud or '(未设，发付费时会强制要求)'}")
     lines.append(f"  github.owner     ：{gh.get('owner') or '(未设)'}")
     lines.append(f"  author           ：{data.get('author') or '(未设)'}")
     return "\n".join(lines)

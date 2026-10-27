@@ -192,6 +192,19 @@ $PY "$SR" probe
 - 四个端点全部 `会话失效` → Cookie 完全没被认（下面两类）
 - 只有部分端点失效 → 会话有效但缺权限，看 `X-Party-Id` / `X-Enterprise-Id`
 
+### 先试 `login --refresh`，不要直接让用户重扫
+
+`probe` 报 403 / 302 时，**配置里的 cookie 过期并不代表登录态没了**：
+Chrome 会在后台静默续期 SSO，持久化 profile 里的 cookie 一直是活的。
+配置里那份字符串只是某次扫码的快照，几小时后必然失效。
+
+```bash
+$PY "$SR" login --refresh      # 无头打开 profile → 验活 → 把现成 cookie 倒回配置
+```
+
+2026-10-26 实测：配置 cookie 已 403，profile 内页面 fetch 却 200，
+`--refresh` 一条命令恢复，全程不用扫码。只有 `--refresh` 也报失效才需要真扫码。
+
 ### 情况 A：Cookie 是坏的（复制被截断）—— **最高频**
 
 `session` 是本站唯一的鉴权凭据，而且**登录后会长到约 4 KB**（里面塞着
@@ -335,6 +348,44 @@ $PY "$SR" creds --set workbuddy.cookie='<新 Cookie>'
 (a) 控制台手工提交；(b) 校准 `payloads.submit` 后重跑。
 **不要盲目重跑整个流程** —— 会创建重复资产。
 
+### 类目变成单字符乱码（`[` `"` `t` `o` `o` …）
+
+**现象**：控制台里服务类目显示成一长串符号和单个字母，删一个反而多一个，
+越删越长。资产详情里 `fields.common.categories` 长这样：
+
+```json
+[{"categoryId":"["},{"categoryId":"\""},{"categoryId":"t"},{"categoryId":"o"}, …]
+```
+
+**根因**：提交时 `categories` 传的是**字符串** `'["tools:office"]'`，
+不是数组。平台把它当可迭代对象逐字符遍历，20 个字符就成 20 个 categoryId。
+最常见来源是 `creds --set workbuddy.categories=["tools:office"]` ——
+命令行只拿得到字符串，原样落盘就完了。
+
+**修法**：只有一条路 —— `withdraw` 退回 draft，改对配置后**重发一整版**。
+类目字段没有可用的 update 端点，控制台表单对坏数据本身也有 bug（删是追加），
+UI 无解。脚本侧现在是双保险：`creds.set_value()` 入口把 JSON 字面量解析成真结构，
+`_as_list` / `normalize_categories` 在出口再兜一次。
+
+**判据**（一条命令自查）：`categories` 长度 > 3，或任一 `categoryId` 长度 ≤ 1 → 乱码。
+
+### 查类目要读 `fields.common`，不是 `currentVersion`
+
+`GET /api/v2/open-platform/capabilities/{assetId}` 里的 `currentVersion`
+**只有 6 个键**：`version` / `versionId` / `status` / `payMode` / `payDetail` / `needEncrypt`。
+**没有 `categories`，也没有 `marketCategories`。**
+
+读 `currentVersion.categories` 会永远得到 `None`，看起来像「服务类目为空」，
+于是按 R01 去修 —— 白撤回一版。真正的类目在这两个位置：
+
+```python
+fields.common.categories        # [{"categoryId": "tools:office"}, ...]
+fields.common.marketCategories  # ["development-tools", ...]
+```
+
+2026-10-27 就这么误判过一次：把 skill-release 1.5.3 的**乱码类目**
+读成了「空类目」。教训是 —— **先确认字段在这个接口里存不存在，再判断值对不对**。
+
 ### 审核驳回：`无资质类目字段，需重新选择对应类目`
 
 平台原话：「**服务类目审核：**无资质类目字段，需重新选择对应类目，如需资质请一并
@@ -413,6 +464,48 @@ $PY "$SR" publish <技能目录> --targets workbuddy --yes --changelog "补充�
 （被驳回的资产不用新建，`find_asset` 会按 name 命中并按状态走 `resubmit`。）
 
 ---
+
+### `pay` 回看是「免费」，明明设了 29 元
+
+**先别怀疑平台不支持 —— 九成是载荷位置写错了。** 2026-10-26 的真实事故：
+控制台界面上显示「一次性付费·29元」，提交成功、状态 `under_review`，
+回读服务端 `pendingVersion.payMode` 却是 **0**，等于按免费送审了。
+
+三个错法，任何一个都会**静默**变免费（返回 200，无任何报错）：
+
+| 错法 | 正确写法 |
+|---|---|
+| `payMode` 放在 submit 载荷**顶层** | 放进 `fields.common` **里面** |
+| `payDetail: [{"amount": 2900}]` | `payDetail: [{"price": 2900}]`（键是 price，单位分） |
+| `payDetail: [{"durationDays": 30}]` | `payDetail: [{"duration_days": 30}]`（snake_case） |
+
+正确形状（¥29 买断）：
+
+```json
+"fields": {"common": {..., "payMode": 1,
+                      "payDetail": [{"price": 2900, "duration_days": 0}],
+                      "needEncrypt": true}}
+```
+
+排查顺序：
+
+```bash
+$PY "$SR" pay <技能目录>                 # 看服务端到底记了什么
+$PY "$SR" withdraw <技能目录>            # 记错了就撤回（只有 draft/待审能撤）
+$PY "$SR" publish <技能目录> --targets workbuddy --yes --pay buyout --price 29
+```
+
+注意：**付费方式过审即锁死**，且已过审的免费资产不能转付费。所以「定错价」
+只能在待审阶段纠正；过了审就只能删掉重建。
+
+### 界面显示 29 元、但重开页面就没了
+
+控制台「付费设置」弹窗的**保存是纯前端状态**（不调任何接口），付费信息只在
+最终 `submit` 的载荷里才落库。所以：
+
+- 用 UI 自动化时，**从设价到点提交必须同一次页面会话**，中间任何 `goto` 重载
+  都会把设置丢掉，提交出去就是 `payMode: 0`；
+- 更稳的做法是根本不碰 UI —— 直接用 `publish --pay ...` 走 API。
 
 ### 已提交、还在审核，但发现字段填错了
 

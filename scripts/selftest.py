@@ -827,6 +827,293 @@ def test_workbuddy_upload_contract() -> None:
     check("withdraw 在 __all__ 里（CLI 要 import 它）", "withdraw" in wb.__all__)
 
 
+def test_category_storage() -> None:
+    """类目存取契约 —— 回归 2026-10-26 类目被逐字符拆成 16 段的乱码事故。
+
+    事故链：`--set categories=["tools:office"]` 命令行只给得出字符串，
+    落盘成了 `'["tools:office"]'`；提交时平台把字符串当可迭代对象遍历，
+    `[` `"` `t` `o` `o` ... 各成一个 categoryId。类目字段没有 update 端点，
+    只能撤回重发一整版才能修回来（1.5.3 就这么废掉的）。
+
+    两道防线都要在：
+      1. 入口 —— creds.set_value 把 JSON 字面量解析成真结构
+      2. 出口 —— release._as_list / pub_workbuddy._coerce_json_list 兜字符串
+    """
+    import creds as _creds
+    import pub_workbuddy as _pw
+
+    check("_maybe_json 把数组字符串转成 list",
+          _creds._maybe_json('["tools:office"]') == ["tools:office"])
+    check("_maybe_json 把对象字符串转成 dict",
+          _creds._maybe_json('{"a":1}') == {"a": 1})
+    check("_maybe_json 不误伤普通字符串",
+          _creds._maybe_json("KEYCxxxx[not-json") == "KEYCxxxx[not-json")
+    check("_maybe_json 放过非 JSON 的中括号开头串",
+          _creds._maybe_json("[oops") == "[oops")
+    check("_maybe_json 对已解析的 list 原样返回",
+          _creds._maybe_json(["tools:office"]) == ["tools:office"])
+
+    check("_as_list 解析数组字符串",
+          release._as_list('["tools:office"]') == ["tools:office"])
+    check("_as_list 对真数组原样返回",
+          release._as_list(["tools:office"]) == ["tools:office"])
+    check("_as_list 对 None 返回 None", release._as_list(None) is None)
+    check("_as_list 支持逗号分隔的裸值",
+          release._as_list("tools:office,development-tools")
+          == ["tools:office", "development-tools"])
+
+    check("_coerce_json_list 解析数组字符串",
+          _pw._coerce_json_list('["a","b"]') == ["a", "b"])
+    check("_coerce_json_list 对真数组原样返回",
+          _pw._coerce_json_list(["a"]) == ["a"])
+
+    # 最关键的一条：绝不能把字符串原样交给平台
+    cats = _pw.normalize_categories('["tools:office"]')
+    check("normalize_categories 吃得下字符串形态且只产出 1 条",
+          isinstance(cats, list) and len(cats) == 1
+          and cats[0].get("categoryId") == "tools:office")
+    check("normalize_categories 不产出单字符类目",
+          all(len(str(c.get("categoryId") or "")) > 1 for c in cats))
+
+
+def test_watch_contract() -> None:
+    """审核巡航契约 —— 发布后登记、过审上线、全部落地即结束。
+
+    这是「发完就不用管」的核心：资产状态机是
+        draft → under_review → approved → published
+    其中 approved 到 published 之间那道坎人一定会忘（真忘过）。
+    巡航靠三件事兜住：`classify()` 判动作、列表记录待审、出列即结束。
+
+    最容易被写错的是 classify 的优先级：**已上线的资产再提交新版本时，
+    asset.status 可能仍报 published**，只有 pendingVersion.status 是
+    under_review。若先看 asset.status，就会把在审版本判成已完成，
+    巡航提前收工、新版本永远不上线。
+    """
+    import watchlist as wl
+
+    # ---- 状态判定：服务端状态 → 下一步动作
+    cases = [
+        (("under_review",), "waiting"),
+        (("reviewing",), "waiting"),
+        (("pending",), "waiting"),
+        (("approved",), "ship"),
+        (("published",), "done"),
+        (("delisted",), "done"),
+        (("rejected",), "rejected"),
+        (("draft",), "withdrawn"),
+        (("PUBLISHED",), "done"),            # 服务端大小写不统一
+        (("weird",), "unknown"),
+        (("",), "unknown"),
+    ]
+    for args, want in cases:
+        check(f"classify{args} -> {want}", wl.classify(*args) == want,
+              f"got {wl.classify(*args)}")
+
+    # 优先级：pending 压过 asset.status
+    check("已上线 + 新版本在审 -> waiting",
+          wl.classify("published", "under_review", "published") == "waiting")
+    check("已上线 + 新版本过审 -> ship（不能因为线上是 published 就收工）",
+          wl.classify("published", "approved", "published") == "ship")
+
+    # ---- 列表读写（临时目录，不碰用户数据）
+    tmp = Path(tempfile.mkdtemp(prefix="cruise-"))
+    try:
+        check("空目录读出来是空列表", wl.load(tmp)["items"] == [])
+        wl.add({"assetId": "os_a", "name": "a", "version": "1.0.0"}, tmp)
+        wl.add({"assetId": "os_b", "name": "b", "version": "2.0.0"}, tmp)
+        check("登记两条", len(wl.load(tmp)["items"]) == 2)
+        wl.add({"assetId": "os_a", "name": "a", "version": "1.1.0"}, tmp)
+        items = wl.load(tmp)["items"]
+        check("同一 assetId 覆盖而不是重复登记",
+              len(items) == 2 and
+              [x["version"] for x in items if x["assetId"] == "os_a"] == ["1.1.0"])
+        check("没有 assetId 拒绝登记", _raises(
+            lambda: wl.add({"name": "x"}, tmp), ValueError))
+
+        wl.touch("os_a", status="published", workdir=tmp)
+        a = [x for x in wl.load(tmp)["items"] if x["assetId"] == "os_a"][0]
+        check("touch 累加巡检次数并记状态",
+              a["checks"] == 1 and a["lastStatus"] == "published")
+
+        check("remove 命中返回 True", wl.remove("os_b", tmp) is True)
+        check("remove 未命中返回 False", wl.remove("os_zzz", tmp) is False)
+        check("remove 后只剩一条", len(wl.load(tmp)["items"]) == 1)
+
+        # 坏文件不能把发布流程一起带崩
+        wl.store_path(tmp).write_text("{ 这不是 json", encoding="utf-8")
+        check("坏存档不抛异常、当空列表", wl.load(tmp)["items"] == [])
+
+        wl.add({"assetId": "os_c"}, tmp)
+        check("clear 清空并返回条数", wl.clear(tmp) == 1 and wl.load(tmp)["items"] == [])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- summary：自动化靠 done 决定要不要停自己
+    check("summary 空列表 -> done=True", wl.summary([])["done"] is True)
+    check("summary 有线上的也 -> done=True（出列后即结束）",
+          wl.summary([{"assetId": "os_a", "action": "waiting"}])["done"] is False)
+    s = wl.summary([{"assetId": "os_a", "action": "waiting"},
+                    {"assetId": "os_b", "action": "rejected"}])
+    check("summary 统计 waiting / needs_human",
+          s["total"] == 2 and s["waiting"] == 1 and s["needs_human"] == 1)
+
+
+def test_ceiling_gate() -> None:
+    """收入天花板门槛 —— 2026-10-27 launch-guard 事故的代码化。
+
+    事故不是「定价 29 太贵」，是**根本没算**：可触达人群 9 人 × 10% × ¥29 ≈ ¥26，
+    一天工钱都不到，我却把文档、脚本、定价、上架提交全做完了。
+
+    所以这条规则要做成阻塞项：算不出人群，或算出来不过线，都不许发付费版本。
+    下面把当时那个真实的错误用数字钉住 —— 任何人把阈值改松，这里立刻红。
+    """
+    rc = rules.revenue_ceiling(9, 29)
+    check("launch-guard 真实反例（9 人 × ¥29）判定为不该做", not rc["pass"])
+    check("该反例天花板约 ¥26", 25 <= rc["ceiling"] <= 27)
+    check("反例 verdict 里带出算式", "9 × 10%" in rc["verdict"])
+
+    # 过线的情况
+    good = rules.revenue_ceiling(500, 29)
+    check("500 人 × ¥29 过线", good["pass"])
+    check("过线天花板 = 500 × 10% × 29 = 1450", good["ceiling"] == 1450.0)
+
+    # 边界：正好 300
+    check("天花板 ¥300 正好过线", rules.revenue_ceiling(100, 30)["pass"])
+    check("天花板 ¥299 不过线", not rules.revenue_ceiling(100, 29.9)["pass"])
+
+    # 异常输入不许静默通过（否则少填一个 0 就绕过门槛了）
+    check("人群 0 → 不过线", not rules.revenue_ceiling(0, 29)["pass"])
+    check("价格为 0 → 不过线", not rules.revenue_ceiling(999, 0)["pass"])
+    check("人群负数 → 归零后不过线", not rules.revenue_ceiling(-5, 29)["pass"])
+    check("人群非数字 → 归零后不过线", not rules.revenue_ceiling("abc", 29)["pass"])
+
+    # 门槛常量本身
+    check("地板价是 ¥300", rules.CEILING_FLOOR == 300.0)
+    check("保守转化率是 10%", rules.CEILING_CONVERSION == 0.10)
+
+    # 通用工具的边界：默认只提示，不许替用户拦。
+    # 2026-10-27 mo 追问「这弄到通用产品里合适吗」—— ¥300 是我的处境（一天工钱），
+    # 不是所有人的标准；别人可能外站有粉丝、或只想立价格锚。
+    src = Path(__file__).with_name("release.py").read_text(encoding="utf-8")
+    check("publish 暴露 --audience", '"--audience"' in src)
+    check("publish 暴露 --strict（可选硬门槛）", '"--strict"' in src)
+    check("默认不拦：没有 --force-pay 这种必备逃生阀", '"--force-pay"' not in src)
+    check("pay-ceiling 在 check 里是 warn 不是 block",
+          '"warn", "workbuddy", "pay-ceiling"' in src
+          or '"warn",\n                    "workbuddy", "pay-ceiling"' in src)
+    check("publish 在 pay_mode 下算天花板", "revenue_ceiling" in src)
+    check("检查项里有 pay-no-audience",
+          "pay-no-audience" in src and "pay-ceiling" in src)
+
+
+def test_pay_contract() -> None:
+    """付费提交契约 —— 回归 2026-10-26「API 发不了付费技能」那次误判。
+
+    误判链条：payMode 放在了 submit 载荷**顶层**、金额键写成 `amount` →
+    平台返回 200 却按免费收审，于是结论被误读成「平台不支持用 API 设付费，
+    只能控制台手工点」。实际用无头浏览器复刻控制台 UI 抓包后，真实形状是：
+
+        fields.common = {..., "payMode": 1,
+                         "payDetail": [{"price": 2900, "duration_days": 0}],
+                         "needEncrypt": true}
+
+    三个键位错一个都不会报错，只会**静默按免费**走 —— 所以必须钉死。
+    """
+    print("[workbuddy 付费契约]")
+    import pub_workbuddy as wb
+
+    f = {"common": {"categories": [{"categoryId": "tools:office"}]}}
+    wb.build_pay_fields(f, 1, 2900, 0)
+    common = f["common"]
+    check("买断：payMode 落在 fields.common 里（不是载荷顶层）",
+          common.get("payMode") == 1, str(common))
+    check("买断：金额键是 price（分），不是 amount",
+          common.get("payDetail") == [{"price": 2900, "duration_days": 0}],
+          str(common.get("payDetail")))
+    check("买断：needEncrypt 存在（控制台同款）", common.get("needEncrypt") is True)
+    check("买断：原有字段不被覆盖",
+          common["categories"] == [{"categoryId": "tools:office"}])
+
+    f2 = {"common": {}}
+    wb.build_pay_fields(f2, 2, 1900, 30)
+    check("订阅：周期键是 snake_case 的 duration_days",
+          f2["common"].get("payDetail") == [{"price": 1900, "duration_days": 30}],
+          str(f2["common"].get("payDetail")))
+
+    f3 = {"common": {"keep": 1}}
+    check("免费：一个付费键都不加",
+          wb.build_pay_fields(f3, 0, 0, 0)["common"] == {"keep": 1})
+
+    check("非法的 payMode 直接抛错（0/1/2 之外）",
+          _raises(lambda: wb.build_pay_fields({"common": {}}, 3, 100), wb.WorkBuddyError))
+    check("付费但没金额直接抛错",
+          _raises(lambda: wb.build_pay_fields({"common": {}}, 1, 0), wb.WorkBuddyError))
+
+    # pay_state：读回来的金额要按「分 → 元」换算，别把 2900 当成 2900 元展示
+    real_call = wb._call
+
+    def fake_detail(base, path, cookie, *, method="GET", **k):  # noqa: ANN001
+        return 200, {"code": 0, "data": {
+            "assetId": "os_p", "status": "under_review",
+            "pendingVersion": {"version": "1.0.0", "status": "under_review",
+                               "payMode": 1,
+                               "payDetail": [{"price": 2900, "duration_days": 0}]}}}
+
+    try:
+        wb._call = fake_detail
+        st = wb.pay_state("https://x", "ck", "os_p")
+    finally:
+        wb._call = real_call
+    check("pay_state 读出 payMode=1", st["pay_mode"] == 1, str(st))
+    check("pay_state 把分换算成元", st["prices"] == [29.0], str(st["prices"]))
+    check("pay_state 中文标签可读", st["pay_mode_label"] == "一次性买断", st["pay_mode_label"])
+    check("pay_state 保留原始 payDetail 供核对",
+          st["pay_detail"] == [{"price": 2900, "duration_days": 0}])
+    check("pay_state 在 __all__ 里（CLI 要 import 它）", "pay_state" in wb.__all__)
+    check("build_pay_fields 在 __all__ 里", "build_pay_fields" in wb.__all__)
+
+
+def test_skillhub_pay_contract() -> None:
+    """SkillHub 付费契约 —— 2026-10-27 从官网 bundle 反解（2026-10-26 那轮
+    「SkillPay 个人跑不通」的结论已过时：官方页明确「个人/企业均可接入」，
+    实测本账号 /api/v1/aipay/status = onboarded:true）。
+
+    publish payload 的 pricing 形状（EnterprisePaidSkillForm / 个人向导同构）：
+        pricing = {billingType:"per_call", pricingMode:"unified",
+                   pricePerCall:"0.10", currency:"CNY"}
+    展示区间 0.01–100 元/次、两位小数。SkillHub 只有按次一种付费形态。
+    """
+    print("[skillhub 付费契约]")
+    import pub_skillhub as sh
+
+    body, _ = sh._multipart(
+        {"slug": "s", "version": "1.0.0", "pricing": {"pricePerCall": 0.1}},
+        [("SKILL.md", b"# x")], "changelog")
+    payload = None
+    # 从 multipart 里抠出 payload JSON
+    import re as _re
+    m = _re.search(rb'name="payload".*?\r\n\r\n(.*?)\r\n--', body, _re.S)
+    check("multipart 里有 payload part", m is not None)
+    if m:
+        payload = json.loads(m.group(1).decode("utf-8"))
+    check("per_call：pricing 四键齐全",
+          payload and payload.get("pricing") == {
+              "billingType": "per_call", "pricingMode": "unified",
+              "pricePerCall": "0.10", "currency": "CNY"},
+          str(payload))
+    check("pricePerCall 是两位小数字符串（不是数字）",
+          payload and isinstance(payload["pricing"]["pricePerCall"], str))
+
+    body2, _ = sh._multipart({"slug": "s", "version": "1.0.0"},
+                             [("SKILL.md", b"# x")], "changelog")
+    m2 = _re.search(rb'name="payload".*?\r\n\r\n(.*?)\r\n--', body2, _re.S)
+    p2 = json.loads(m2.group(1).decode("utf-8")) if m2 else {}
+    check("免费：payload 不带 pricing 键", "pricing" not in p2, str(p2))
+
+    check("aipay_status / precheck_paid_skill 在 __all__ 里",
+          "aipay_status" in sh.__all__ and "precheck_paid_skill" in sh.__all__)
+
+
 def test_github_identity(tmp_root: Path) -> None:
     """提交身份防线 —— 这是**真事故**的回归用例，不是假想。
 
@@ -1100,6 +1387,11 @@ def main() -> int:
         test_workbuddy_user_agent()
         test_har_extraction(tmp_root)
         test_workbuddy_upload_contract()
+        test_pay_contract()
+        test_skillhub_pay_contract()
+        test_category_storage()
+        test_watch_contract()
+        test_ceiling_gate()
         test_github_identity(tmp_root)
         test_audit()
         test_version()

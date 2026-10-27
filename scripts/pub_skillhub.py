@@ -180,6 +180,19 @@ def _multipart(meta: dict, files: list[tuple[str, bytes]],
     # iconUrl 为空时从 payload 里去掉（官网发的是 undefined），其余字段保持原样
     if payload["iconUrl"] is None:
         payload.pop("iconUrl")
+    # 付费计费（2026-10-27 从 skillhub 前端 bundle 反解，EnterprisePaidSkillForm
+    # 与个人发布向导同构）：billingMode=per_call 时 payload 带 pricing 对象，
+    # 金额字符串两位小数、币种固定 CNY，展示区间 0.01–100 元/次。
+    # 注意 SkillHub 只有按次计费一种付费形态（x402：调用→402 账单→付款→验付），
+    # 没有买断/订阅档 —— 买断要在收费后端里自己实现（首单发 license key）。
+    pricing = meta.get("pricing")
+    if isinstance(pricing, dict) and pricing:
+        payload["pricing"] = {
+            "billingType": "per_call",
+            "pricingMode": "unified",
+            "pricePerCall": f"{float(pricing['pricePerCall']):.2f}",
+            "currency": "CNY",
+        }
     buf = bytearray()
 
     def part(name: str, data: bytes, filename: str | None = None,
@@ -260,13 +273,31 @@ def format_error(status: int, body: dict) -> str:
 
 
 def publish(host: str, token: str, skill_dir: Path, meta: dict,
-            changelog: str, dry_run: bool = False, cookie: str = "") -> dict:
+            changelog: str, dry_run: bool = False, cookie: str = "",
+            price_per_call: float | None = None) -> dict:
     """执行发布。dry_run=True 时只做本地校验，不发网络请求。
+
+    price_per_call：按次调用单价（元，0.01–100，两位小数）。给定即走 SkillHub
+    付费发布（payload.pricing，per_call）。前置条件（官方教程 2026-10-27 反解）：
+      1. 账号完成「SkillPay 个人入驻」（GET /api/v1/aipay/status → onboarded:true），
+         用 aipay_status() 查；
+      2. 技能必须调用真实收费后端（402 → 付款 → Payment-Proof 验付 → 交付），
+         纯知识包会被预检盯住、审核驳回 —— 不能仅凭文案声明替代真实服务；
+      3. 建议提交前先跑 precheck_paid_skill() 拿官方预检结果。
 
     返回 {'ok', 'status', 'message', 'files', 'bytes', 'response'}
     """
     files = collect_files(skill_dir)
     total = sum(len(d) for _, d in files)
+
+    if price_per_call is not None:
+        if not 0.01 <= price_per_call <= 100:
+            return {"ok": False, "status": "invalid", "files": len(files),
+                    "bytes": total,
+                    "message": f"per_call 单价 {price_per_call} 越界：SkillHub 展示区间 0.01–100 元/次",
+                    "response": None}
+        meta = dict(meta)
+        meta["pricing"] = {"pricePerCall": price_per_call}
 
     problems = validate(meta)
     no_ext = [r for r, _ in files if not Path(r).suffix]
@@ -316,7 +347,8 @@ def skill_url(host: str, slug: str) -> str:
 #   reviewStatus=pending 时技能级 iconUrl 一直是 null —— 图标随版本一起过审，
 #   不是「没传上去」。看到 null 先别急着重传。
 
-__all__ += ["list_my_skills", "list_versions", "icon_report"]
+__all__ += ["list_my_skills", "list_versions", "icon_report",
+            "aipay_status", "precheck_paid_skill"]
 
 
 def _read(host: str, path: str, token: str = "", cookie: str = "") -> dict:
@@ -386,3 +418,54 @@ def icon_report(host: str, slug: str, token: str = "",
             "icon_audit_submitted_at": latest.get("iconAuditSubmittedAt"),
             "version_review_status": review, "verdict": verdict,
             "versions": versions}
+
+
+def aipay_status(host: str, token: str = "", cookie: str = "") -> dict:
+    """SkillPay 个人入驻状态（2026-10-27 从 bundle 反解 + 实测）。
+
+    `GET /api/v1/aipay/status` → `{onboarded: bool, phone, onboardedAt, status}`。
+    onboarded=true 是发布付费 Skill（per_call）的前置条件；没入驻会拿 401/403。
+    注意：`/api/v1/merchant/info` 是**企业商户**通道，个人账号只会拿到
+    403 ENTERPRISE_NOT_VERIFIED —— 别把它当「个人不能付费」的证据。
+    """
+    try:
+        body = _read(host, "/api/v1/aipay/status", token=token, cookie=cookie)
+    except SkillHubError as exc:
+        return {"onboarded": False, "status": "error", "message": str(exc)}
+    return {"onboarded": bool(body.get("onboarded")),
+            "status": body.get("status") or "",
+            "phone": body.get("phone") or "",
+            "onboarded_at": body.get("onboardedAt")}
+
+
+def precheck_paid_skill(host: str, skill_md_path: Path, token: str = "",
+                        cookie: str = "") -> dict:
+    """付费 Skill 官方预检（X402 合规）。发布向导在提交前对 SKILL.md 跑这条：
+
+    `POST /paid-skills/precheck`（multipart，字段名 file = SKILL.md 文件）
+    → `{compliance: "pass" | ...}`；不通过时向导允许「仍要提交」，但审核会盯。
+
+    预检查的是 SKILL.md 里有没有描述真实 402 收费链路（Payment-Needed 账单、
+    Payment-Proof 验付重试等）。纯知识包过不了这一关 —— 官方原话：
+    「Skill 可以通过官方 CLI、脚本或依赖封装这些能力；不能仅凭文案声明替代
+    真实可用的服务」。
+    """
+    skill_md_path = Path(skill_md_path)
+    if not skill_md_path.exists():
+        raise SkillHubError(f"SKILL.md 不存在：{skill_md_path}")
+    data = skill_md_path.read_bytes()
+    boundary = "----skillrelease-precheck" + str(int(time.time() * 1000))
+    buf = bytearray()
+    buf.extend(f"--{boundary}\r\n".encode())
+    buf.extend(b'Content-Disposition: form-data; name="file"; filename="SKILL.md"\r\n')
+    buf.extend(b"Content-Type: text/markdown\r\n\r\n")
+    buf.extend(data)
+    buf.extend(f"\r\n--{boundary}--\r\n".encode())
+    status, body, _ = _request(
+        f"{host.rstrip('/')}/api/v1/paid-skills/precheck",
+        token=token, cookie=cookie, data=bytes(buf), method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    if status != 200:
+        raise SkillHubError(format_error(status, body if isinstance(body, dict) else {}))
+    return body

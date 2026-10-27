@@ -48,7 +48,9 @@ from pathlib import Path
 __all__ = ["WorkBuddyError", "DEFAULT_BASE", "whoami", "probe", "upload_and_submit",
            "upload_cover", "withdraw", "normalize_categories", "CAPABILITIES",
            "PRESIGN", "SCENE_COVER", "sniff_cookie", "cookie_from_har",
-           "find_asset", "unwrap", "set_user_agent", "user_agent"]
+           "find_asset", "unwrap", "set_user_agent", "user_agent",
+           "list_assets", "pending_release", "publish_asset", "pay_state",
+           "review_state", "build_pay_fields"]
 
 DEFAULT_BASE = "https://open.workbuddy.cn"
 CAPABILITIES = "/api/v2/open-platform/capabilities"
@@ -526,6 +528,182 @@ def withdraw(base: str, cookie: str, asset_id: str, *,
     }
 
 
+def pay_state(base: str, cookie: str, asset_id: str, *, party_id: str = "",
+              enterprise_id: str = "") -> dict:
+    """只读：把某资产的付费状态从服务端读回来（发布前/后核验用）。
+
+    为什么单独做一个函数：付费方式是**版本级**属性，一旦过审就锁死，
+    「我设了 29 元」和「平台记的是 29 元」是两件事 —— 2026-10-26 就出现过
+    控制台界面显示「一次性付费·29元」而服务端 payMode 仍为 0 的情况
+    （前端状态没随 submit 发出去）。所以任何付费发布都必须回读。
+
+    返回：{asset_id, status, pay_mode, pay_mode_label, prices(元), pay_detail(原始),
+           version, version_status}
+    """
+    asset_id = str(asset_id or "").strip()
+    if not asset_id:
+        raise WorkBuddyError("pay_state 需要 assetId（os_...）")
+    status, body = _call(base, f"{CAPABILITIES}/{asset_id}", cookie, method="GET",
+                         party_id=party_id, enterprise_id=enterprise_id)
+    if status != 200 or code_of(body) not in (0, None):
+        _auth_or_raise(status, body)
+        raise WorkBuddyError(f"读取资产失败（{status}）：{_brief(body)}")
+    d = unwrap(body)
+    ver = d.get("pendingVersion") or d.get("currentVersion") or {}
+    detail = ver.get("payDetail") or []
+    prices, days = [], []
+    for it in detail if isinstance(detail, list) else []:
+        if not isinstance(it, dict):
+            continue
+        for k in ("price", "amount"):
+            if it.get(k) is not None:
+                prices.append(int(it[k]) / 100)
+                break
+        if it.get("duration_days") or it.get("durationDays"):
+            days.append(int(it.get("duration_days") or it.get("durationDays")))
+    mode = int(ver.get("payMode") or 0)
+    return {
+        "asset_id": str(d.get("assetId") or asset_id),
+        "status": str(d.get("status") or ""),
+        "version": str(ver.get("version") or ""),
+        "version_status": str(ver.get("status") or ""),
+        "pay_mode": mode,
+        "pay_mode_label": {0: "免费", 1: "一次性买断", 2: "月订阅"}.get(mode, f"未知({mode})"),
+        "prices": prices,
+        "days": days,
+        "pay_detail": detail,
+    }
+
+
+def review_state(base: str, cookie: str, asset_id: str, *, party_id: str = "",
+                 enterprise_id: str = "") -> dict:
+    """只读：某资产**现在走到哪一步了**（巡航巡检的事实来源）。
+
+    只返回事实，不做判断 —— 「该不该上线」由 `watchlist.classify()` 决定，
+    这样一个纯函数可以穷举测试，网络层坏了也不影响判定逻辑。
+
+    为什么要同时看 `pendingVersion` 和 `currentVersion`：
+    已经上线的资产再提交新版本时，`asset.status` 有时仍报 `published`，
+    真正的「在审核」只体现在 `pendingVersion.status` 上。只看 asset.status
+    会把在审的版本误判成已完成，巡航就会提前收工。
+
+    返回：{asset_id, status, current{status,version}, pending{status,version,rejectReason},
+           version, detail}
+    """
+    asset_id = str(asset_id or "").strip()
+    if not asset_id:
+        raise WorkBuddyError("review_state 需要 assetId（os_...）")
+    status, body = _call(base, f"{CAPABILITIES}/{asset_id}", cookie, method="GET",
+                         party_id=party_id, enterprise_id=enterprise_id)
+    if status != 200 or code_of(body) not in (0, None):
+        _auth_or_raise(status, body)
+        raise WorkBuddyError(f"读取审核状态失败（{status}）：{_brief(body)}")
+    d = unwrap(body)
+    cur = d.get("currentVersion") or {}
+    pend = d.get("pendingVersion") or {}
+
+    def slim(v: dict) -> dict:
+        return {
+            "status": str(v.get("status") or ""),
+            "version": str(v.get("version") or ""),
+            "version_id": v.get("versionId"),
+            "pay_mode": int(v.get("payMode") or 0),
+            "reject_reason": str(v.get("rejectReason") or v.get("reason") or ""),
+        }
+
+    return {
+        "asset_id": str(d.get("assetId") or asset_id),
+        "name": str(d.get("displayName") or d.get("name") or ""),
+        "status": str(d.get("status") or ""),
+        "current": slim(cur),
+        "pending": slim(pend),
+        "version": str(pend.get("version") or cur.get("version") or ""),
+        "detail": d,
+    }
+
+
+def list_assets(base: str, cookie: str, *, capability_type: str = "skill",
+                party_id: str = "", enterprise_id: str = "") -> list[dict]:
+    """列出本主体的全部资产（skill/expert/connector/buddy_app）。"""
+    items: list[dict] = []
+    page = 1
+    while True:
+        status, body = _call(base, f"{CAPABILITIES}/list", cookie, method="POST",
+                             payload={"capabilityType": capability_type,
+                                      "pageSize": 50, "pageNum": page},
+                             party_id=party_id, enterprise_id=enterprise_id)
+        if status != 200:
+            _auth_or_raise(status, body)
+            raise WorkBuddyError(f"资产列表获取失败（{status}）：{_brief(body)}")
+        batch = (unwrap(body) or {}).get("items") or []
+        items.extend(batch)
+        if len(batch) < 50:
+            break
+        page += 1
+    return items
+
+
+def pending_release(base: str, cookie: str, *, party_id: str = "",
+                    enterprise_id: str = "") -> list[dict]:
+    """找出「过审待发布」的资产 —— 审核通过了、但还没点发布按钮的那种。
+
+    状态机（控制台 chunk 5762 的枚举，2026-10-26 实证）：
+        draft → under_review → approved → published
+        （另有 rejected / delisted / removed）
+    `approved` 就是卡在「过审了但没上线」的那个状态 —— 长期不登控制台
+    就会一直烂在这里，这正是 `ship` 子命令要自动解决的事。
+    """
+    out = []
+    for it in list_assets(base, cookie, party_id=party_id,
+                          enterprise_id=enterprise_id):
+        if str(it.get("status") or "") == "approved":
+            cur = it.get("currentVersion") or {}
+            out.append({
+                "asset_id": it.get("assetId"),
+                "name": it.get("name"),
+                "version": cur.get("version"),
+                "version_id": cur.get("versionId"),
+            })
+    return out
+
+
+def publish_asset(base: str, cookie: str, asset_id: str, *,
+                  visible_scope: list[str] | None = None,
+                  party_id: str = "", enterprise_id: str = "") -> dict:
+    """把过审（approved）的资产真正发布上线 —— 控制台那个「发布」按钮。
+
+    **真实契约**（2026-10-26 从控制台 chunk 5762 反解，HTTP 层未实测到成功样本
+    —— 当前所有资产已是 published，没有可安全试跑的对象）：
+
+      POST /api/v2/open-platform/capabilities/{assetId}/publish
+      body {"visibleScope": ["ALL"]}          // 个人主体只能 ALL
+      → 旁证：同一 chunk 里 delist/relist/visibility/withdraw 全家都是
+        POST /capabilities/{assetId}/{verb}、body 小对象的同构形态
+
+    visibleScope 枚举：`ALL`（对全部用户可见）| `BUDDY_APP_ONLY`
+    （仅 Buddy App；个人主体在 UI 里被禁用）。见 `capApi.publish` 的
+    调用点：埋点 `asset_release`，channel 由是否含 ALL 决定 consumer/enterprise。
+    """
+    asset_id = str(asset_id or "").strip()
+    if not asset_id:
+        raise WorkBuddyError("publish_asset 需要 assetId（os_... / oe_...）")
+    scope = visible_scope or ["ALL"]
+    status, body = _call(base, f"{CAPABILITIES}/{asset_id}/publish", cookie,
+                         method="POST", payload={"visibleScope": scope},
+                         party_id=party_id, enterprise_id=enterprise_id)
+    if status != 200 or code_of(body) not in (0, None):
+        _auth_or_raise(status, body)
+        raise WorkBuddyError(f"发布上线失败（{status}）：{_brief(body)}")
+    d = unwrap(body) or {}
+    return {
+        "ok": True,
+        "asset_id": str(d.get("assetId") or asset_id),
+        "status": str(d.get("status") or "published"),
+        "message": f"已发布上线（assetId={asset_id}，visibleScope={scope}）",
+        "response": body,
+    }
+
+
 def _png_size(png_path: Path) -> tuple[int, int]:
     """读 PNG IHDR 拿宽高。坏文件/非 PNG 抛 WorkBuddyError。"""
     try:
@@ -596,6 +774,21 @@ def upload_cover(base: str, cookie: str, png_path: Path, *,
             "preview_url": str(data.get("previewUrl") or data.get("url") or "")}
 
 
+def _coerce_json_list(v):
+    """把字符串形态的 JSON 数组（creds --set 落盘产物）转回真 list。"""
+    if v is None or v == "":
+        return []
+    if isinstance(v, list):
+        return v
+    if isinstance(v, str):
+        try:
+            parsed = json.loads(v)
+            return parsed if isinstance(parsed, list) else [v]
+        except (ValueError, TypeError):
+            return [x.strip() for x in v.split(",") if x.strip()]
+    return [v]
+
+
 def normalize_categories(cats: list | None) -> list[dict]:
     """把类目配置规范成平台要的 `[{"categoryId":…,"qualifications":[…]}]`。
 
@@ -634,6 +827,11 @@ def normalize_categories(cats: list | None) -> list[dict]:
     `tools:office` 这类 `qualificationRequired: false` 的类目必须**不带 key** 才能过。
     """
     out: list[dict] = []
+    # ⚠️ 字符串入参必须先转数组，否则 for 循环逐字符遍历，
+    # '["tools:office"]' 会变成 16 个单字符 categoryId（2026-10-26 乱码事故根因，
+    # 且该字段在 /update 端点是只读的，改不回来，只能重传包修复）。
+    if isinstance(cats, str):
+        cats = _coerce_json_list(cats)
     for item in cats or []:
         cid = ""
         quals: list = []
@@ -649,6 +847,51 @@ def normalize_categories(cats: list | None) -> list[dict]:
             cat["qualifications"] = quals
         out.append(cat)
     return out
+
+
+def build_pay_fields(fields: dict, pay_mode: int = 0, pay_amount: int = 0,
+                     pay_days: int = 0) -> dict:
+    """把付费信息并进 submit 的 `fields.common`，返回同一个 dict（原地改）。
+
+    **这是全流程最容易错的一步**，三个坑都在 2026-10-26 用无头浏览器复刻控制台
+    UI 抓包后确认，之前把「API 发不了付费」误判成平台限制，其实是载荷形状不对：
+
+    1. `payMode` / `payDetail` / `needEncrypt` 必须放在 **fields.common 里面**。
+       放在 submit 载荷顶层时平台**静默丢弃**（返回 200、无报错、按免费收审）。
+    2. `payDetail` 元素的金额键是 **price**（不是 amount），单位**分**。
+    3. 周期键是 snake_case 的 **duration_days**（不是 durationDays）；
+       买断写 0，订阅写周期天数。
+
+    控制台实测载荷（¥29 买断）::
+
+        "fields": {"common": {..., "payMode": 1,
+                              "payDetail": [{"price": 2900, "duration_days": 0}],
+                              "needEncrypt": true}}
+
+    另外两条业务铁律（平台侧，非本函数能改）：
+    - 付费方式是**版本级**属性，过审后不可改；
+    - 已过审的免费资产**不能**转付费 —— 想收费就必须第一次提交就带上，
+      或在还是 draft/待审时撤回重提。
+    """
+    pay_mode = int(pay_mode or 0)
+    if pay_mode not in (0, 1, 2):
+        raise WorkBuddyError(f"pay_mode 只能是 0免费/1买断/2订阅，收到 {pay_mode}")
+    if pay_mode and int(pay_amount or 0) <= 0:
+        raise WorkBuddyError("设了 pay_mode 却没给金额（pay_amount，单位：分）")
+    if pay_mode == 0:
+        return fields
+
+    detail = [{"price": int(pay_amount)}]
+    if int(pay_days or 0) > 0:
+        detail[0]["duration_days"] = int(pay_days)
+    else:
+        detail[0]["duration_days"] = 0
+
+    common = fields.setdefault("common", {})
+    common["payMode"] = pay_mode
+    common["payDetail"] = detail
+    common.setdefault("needEncrypt", True)
+    return fields
 
 
 def upload_and_submit(base: str, cookie: str, zip_path: Path, *,
@@ -680,6 +923,13 @@ def upload_and_submit(base: str, cookie: str, zip_path: Path, *,
        的 frontmatter 自己取；`fields.common` 需要 categories（**资质类目，不可为空**）
        / marketCategories（市场类目）/ coverObjectKey / releaseNote，
        格式与取值见 `normalize_categories()`。
+
+    **付费提交契约**（2026-10-26 无头浏览器复刻控制台 UI 实测，submit 200 + 回读确认）：
+    `fields.common` 里放 `"payMode": 1, "payDetail": [{"price": 2900, "duration_days": 0}],
+    "needEncrypt": true`。三个易错点：payMode 放**载荷顶层会被静默丢弃**（必须进
+    fields.common）；金额键是 **price** 不是 amount（单位：分）；周期键是 snake_case 的
+    **duration_days**。控制台「付费设置」弹窗的保存是纯前端状态，付费信息只在
+    submit 时随载荷落库 —— 所以纯 API 路径完全可行，不需要 UI 操作。
 
     `dry_run=True` 只校验本地文件与鉴权，不产生任何服务端副作用。
     """
@@ -772,7 +1022,8 @@ def upload_and_submit(base: str, cookie: str, zip_path: Path, *,
         )
     fields = {"common": {
         "categories": cats,
-        "marketCategories": [str(x) for x in (market_categories or [])],
+        # 同 normalize_categories：字符串必须先转数组，防止逐字符遍历
+        "marketCategories": _coerce_json_list(market_categories) or [],
         "coverObjectKey": cover_object_key,
         "releaseNote": changelog,
     }}
@@ -786,17 +1037,7 @@ def upload_and_submit(base: str, cookie: str, zip_path: Path, *,
         action = ACTION_REPUBLISH
     # 付费方式是**版本级**属性且发布后不可改（免费资产服务端拒绝转付费，
     # 2026-10-26 实测 /pay 端点对 published+payMode=0 返回 update goods failed）。
-    # payMode：0=免费 1=买断 2=订阅；payAmount 单位是**分**。
-    if pay_mode not in (0, 1, 2):
-        raise WorkBuddyError(f"pay_mode 只能是 0/1/2，收到 {pay_mode}")
-    if pay_mode and pay_amount <= 0:
-        raise WorkBuddyError("设了 pay_mode 却没给 pay_amount（单位：分）")
-    pay_detail = []
-    if pay_mode:
-        pd = {"amount": int(pay_amount)}
-        if pay_days:
-            pd["durationDays"] = int(pay_days)
-        pay_detail = [pd]
+    fields = build_pay_fields(fields, pay_mode, pay_amount, pay_days)
 
     status, body = _call(base, f"{CAPABILITIES}/submit", cookie, method="POST",
                          payload={
@@ -808,8 +1049,6 @@ def upload_and_submit(base: str, cookie: str, zip_path: Path, *,
                              "uploadToken": upload_token,
                              "clientToken": f"pub_{uuid.uuid4()}",
                              "fields": fields,
-                             **({"payMode": pay_mode, "payDetail": pay_detail}
-                                if pay_mode else {}),
                          },
                          party_id=party_id, enterprise_id=enterprise_id)
     if status != 200 or code_of(body) not in (0, None):
@@ -826,9 +1065,11 @@ def upload_and_submit(base: str, cookie: str, zip_path: Path, *,
                          f"versionId={sdata.get('versionId')}），审核期约 7 个工作日")
     result["response"] = body
 
-    # 付费校验闭环：submit 载荷里的 payMode 不保证被收（服务端可能静默丢弃），
-    # 而付费方式一旦过审就不可改 → 必须立刻回读，没带上就先试 /pay 端点，
-    # 再不行就 withdraw 撤回，绝不让一个「本应收费的资产」以免费形态躺在审核队列里。
+    # 付费校验闭环：提交成功 ≠ 定价生效。付费方式是版本级属性、过审即锁死，
+    # 所以必须立刻回读；没带上先试 /pay 兜底，再不行就 withdraw 撤回，
+    # 绝不让一个「本应收费的资产」以免费形态躺在审核队列里。
+    # （2026-10-26 真实踩过：控制台界面显示 ¥29，服务端 payMode 仍是 0。）
+    pay_detail = (fields.get("common") or {}).get("payDetail") or []
     if pay_mode:
         aid = result["asset_id"]
         got_mode = got_detail = None
@@ -841,7 +1082,9 @@ def upload_and_submit(base: str, cookie: str, zip_path: Path, *,
         except WorkBuddyError:
             pass
         if got_mode != pay_mode:
-            # 兜底一：/pay 端点（控制台「付费设置」走的通道），pending 状态下可用
+            # 兜底：/pay 端点。实测对 draft/under_review 都可能回
+            # 「update goods failed」（见 2026-10-26 记录），属已知不可靠路径，
+            # 留着只是「万一」。真正的修复手段始终是 withdraw 后退回 draft 重新 submit。
             try:
                 _call(base, f"{CAPABILITIES}/{aid}/pay", cookie,
                       method="POST",

@@ -5,7 +5,7 @@ display_name_en: Skill Release Manager
 description: "把本地技能一句话发到 GitHub / SkillHub / open.workbuddy 三处，并把两个平台的校验规则前置成本地断言。TRIGGER: 用户说「发布这个技能」「上架 skill」「更新到 skillhub」「推到 open.workbuddy」「同步到 GitHub」「技能发布报解析失败」「目录层级超限」「不允许的文件类型」「slug 已被封禁」「slug 冲突」「图标不让传」「撤回待审版本」「改完再重新提交」，或给出技能目录要求分发。DO NOT TRIGGER: 只是新建技能骨架（属于 skill-scaffold）；只是查找/安装别人的技能；只是普通代码提交。"
 description_zh: 把技能一次分发到三个平台：GitHub 仓库、SkillHub 市场、open.workbuddy。同一份内容派生三种形态，平台要的字段（slug / displayName / author）自动投影到临时副本而不污染源文件；发布前跑规则引擎，把「无扩展名文件」「根目录图标」「目录层级超限」「slug 被封禁」这类真实被拒过的坑拦在本地。SkillHub 支持 API Key 与会话 Cookie 两条凭据通道。默认演练，加 --yes 才真发。
 description_en: "Release a skill to three platforms in one command: a GitHub repo, the SkillHub marketplace, and open.workbuddy. One source of content, three packaging shapes; platform-specific frontmatter (slug / displayName / author) is projected into a staging copy instead of polluting the source. A rule engine blocks locally the exact failures platforms rejected before — extensionless files, root-level icons, over-deep paths, banned slugs. SkillHub accepts either an API key or a browser session cookie. Dry-run by default; --yes to actually publish."
-version: 1.5.3
+version: 1.5.7
 allowed-tools: Bash, Read, Write, Glob, Grep, AskUserQuestion
 category: 开发编程
 license: MIT
@@ -58,6 +58,8 @@ tags: [release, publish, skillhub, github, workbuddy]
 | **高（必须确认）** | `--force` 忽略阻断项 | 先逐条列出被忽略的规则与后果 |
 | **中（范围明确即可）** | `publish --yes` 到 GitHub / SkillHub | 目标明确直接执行 |
 | **低（直接执行）** | `check` / `doctor` / `probe` / `creds`（查看） / `audit`（只读） | 无需确认 |
+| **低（直接执行）** | `watch` / `watch --check`（只读巡检） | 无需确认 |
+| **低（直接执行）** | `watch --check --ship`（把**已过审**的资产上线） | 无需确认 —— 这是发布流程的收尾，用户发的时候就已经授权了 |
 
 **额外规则：**
 
@@ -67,6 +69,9 @@ tags: [release, publish, skillhub, github, workbuddy]
   **把命中清单交给用户判断，不自行删改文件**
 - `probe` / `audit` 只做只读探测，任何情况下不写入
 - 用户说「算了」「先不发」 → 立即中止
+- **发布到 open.workbuddy 成功后，巡航是流程的一部分，不是可选动作**：
+  结果里 `watched: true` → 建/唤醒每日巡航任务（跑 `watch --check --ship`）；
+  巡航报 `done: true` → 把该任务暂停。别让任务空跑，也别让资产过审后干等
 
 ## 核心操作
 
@@ -110,6 +115,53 @@ $PY "$SR" publish "<技能目录>" --yes --bump patch
 ```
 
 默认走三个平台。未配置凭据的平台会**跳过并在结果里标注**，不影响其他平台。
+收费技能加 `--pay buyout --price 29`，详见下方「付费发布」。
+
+### 发布后自动巡航（过审自动上线，落地即结束）
+
+**发布成功不等于这件事结束了。** 资产状态机是：
+
+```
+draft → under_review → approved → published
+                          ↑           ↑
+                      过审待发布    真正在市场里可见
+```
+
+`approved` 之后**还要再调一次发布**才算上架。人不会天天登控制台，
+于是资产常常在这个状态里躺到下次想起来为止 —— 这段时间等于白发。
+
+所以 `publish --yes` 提交成功后会自动把资产登记进巡航列表，
+之后靠 `watch` 每天扫一遍：
+
+```bash
+$PY "$SR" watch                        # 看谁在等（版本、定价、查过几次）
+$PY "$SR" watch --check                # 巡检一次，只报不动手
+$PY "$SR" watch --check --ship         # 巡检 + 自动上线（巡航用这个）
+$PY "$SR" watch --stop                 # 停止巡航（清空列表）
+$PY "$SR" watch --check --ship --json  # 机器可读，含 done 字段
+```
+
+**三条规则**：
+
+| 服务端状态 | 动作 | 是否出列 |
+|---|---|---|
+| `under_review` | 继续等 | 否 |
+| `approved` | `--ship` 时自动上线 | 是（上线后） |
+| `published` / `rejected` / `draft` | 已落地：报结果即可 | 是 |
+
+**列表空了就是巡航结束**——`--json` 的 `summary.done` / `done` 为 `true`
+即「没有要等的了」。定时任务见到这个信号就停自己，别空跑。
+
+**自动化怎么挂**：发布完成后（结果里有 `watched: true`）创建一个每日任务跑
+`watch --check --ship`，并在 prompt 里写死「`done: true` 时把本任务暂停」。
+**按名字匹配，不要重复建**——任务统一叫「技能审核巡航（过审自动上线，落地自停）」：
+已在就先 `status=ACTIVE` 唤醒，没有才新建。一个任务管全部资产，
+绝不按 assetId 一个资产建一个（那样一多就没人管得过来）。
+细节、分支处理、失败模式见 [cruise.md](./references/cruise.md)。
+
+> 顺带说明：`ship` 子命令是老版本留的「一次性扫全站过审资产」，不带列表、
+> 不认「都过完了没有」。新流程用 `watch`，`ship` 只在想手动补救时用。
+
 
 ### 登录（推荐：扫码，不用导 HAR）
 
@@ -117,8 +169,14 @@ $PY "$SR" publish "<技能目录>" --yes --bump patch
 $PY "$SR" login                       # 弹出浏览器 → 你扫码 → 自动收尾
 $PY "$SR" login --timeout 600         # 慢慢扫
 $PY "$SR" login --fresh               # 换一个全新 profile（旧会话残留时用）
+$PY "$SR" login --refresh             # 不开窗口：把 profile 里的活会话重新导回配置
 $PY "$SR" login --check-only          # 只验活，不开浏览器
 ```
+
+**遇到 403 先试 `--refresh`，别急着让用户重新扫码。** Chrome 会在后台静默刷新
+SSO 会话，所以 profile 里的 cookie 一直是活的，而配置里那份字符串只是某次扫码
+的快照，几小时后就 403。`--refresh` 用无头模式打开 profile、验活、把现成 cookie
+重新导出，全程不打扰用户（2026-10-26 实测：profile 有效而配置 403，一条命令恢复）。
 
 **用户只需要做一件事：扫码。其余四步全自动。**
 
@@ -206,22 +264,80 @@ $PY "$SR" probe
 「允许生成包含敏感数据的 HAR」，别走剪贴板。
 详见 [references/troubleshooting.md](./references/troubleshooting.md)。
 
-### 付费资产的铁律（2026-10-26 实测）
+### 付费发布（一次性买断 / 月订阅，全自动）
 
-payMode 是**版本级**属性（`currentVersion.payMode`：0=免费 1=买断 2=订阅），
-金额单位是**分**。三条死路 + 一条活路：
+付费走 `publish` 的两个参数，纯 API 完成，**不需要人点控制台**：
 
-1. **API `submit` 会静默丢弃 payMode** —— 载荷里带上也不收，回读 `pendingVersion.payMode` 恒为 0
-2. **`POST /capabilities/{assetId}/pay`（控制台"付费设置"通道）**：
-   对 published+payMode=0 返回 `update goods failed`（免费转付费被服务端拒绝）；
-   对 draft / pending 同样 `update goods failed`，载荷变体（durationDays/goodsType/goods 数组）全试过，均不收
-3. **已过审的免费资产永远变不成付费** —— 与官方 FAQ 一致
-4. **活路只有一条：在控制台 UI 里提交时设置付费方式** —— 自动化能做的是把包、
-   类目、封面全部放进草稿，最后一步「设置付费 + 提交」必须人点
+```bash
+$PY "$SR" publish <技能目录> --targets workbuddy --yes --pay buyout --price 29
+$PY "$SR" publish <技能目录> --targets workbuddy --yes --pay subscription --price 19 --pay-days 30
+$PY "$SR" publish <技能目录> --targets workbuddy --yes --pay free     # 显式覆盖配置里的付费值
+```
 
-所以 `upload_and_submit()` 的行为是：带 `pay_mode` 提交 → 回读验证 →
-没带上就自动 withdraw 撤回并报错，**绝不留下一个「本应收费却免费」的待审版本**。
-草稿已就位时，引导用户去控制台完成最后一步（设付费 → 提交）。
+也可以把定档写进配置，之后直接 `publish`：
+
+```bash
+$PY "$SR" creds --set workbuddy.pay_mode=1 --set workbuddy.pay_amount=29
+```
+
+`pay_mode` 是**版本级**属性：`0=免费 1=一次性买断 2=月订阅`；`pay_amount` 对外是**元**，
+提交时自动换算成分。发完用 `pay` 回看服务端记的到底是什么：
+
+```bash
+$PY "$SR" pay <技能目录>        # 或 pay os_e1a727dfe880fe87
+```
+
+### 发付费之前先算一行（可选，但建议算）
+
+```bash
+$PY "$SR" publish <技能目录> --pay buyout --price 29 --audience 9
+# → ! 收入天花板：天花板 9 × 10% × ¥29 = ¥26，低于 ¥300 → 不该做
+```
+
+`--audience` 填「**已证明会装这类东西的人**」——最省事的来源是同类免费资产的历史安装量
+（`release.py metrics --days 90`），不是全平台用户数。
+
+工具只把算式摆出来，**默认不拦你**。原因是它本来就不能替你做这个判断：
+
+- `¥300` 是参照物不是法律，对一个人是一天工钱，对另一个人是一小时
+- `10%` 转化率是保守拍的值，没有成交样本
+- 付费的动机不止赚钱：筛人、立价格锚、试水都算
+
+真要硬门槛，加 `--strict`（或 `creds --set workbuddy.strict_ceiling=true`）：
+那样付费发布必须给 `--audience`，且不过线就拒绝提交。
+
+**这条规则的来历**：2026-10-27 做过一个 ¥29 的付费技能，可触达人群只有 9 人，
+天花板 ¥26，但整套文档、脚本、定价、上架全做完了才被指出来。
+问题不是定价贵，是**根本没算**。所以门槛留在工具里，但只做提示。
+
+**三个必须记住的坑**（2026-10-26 用无头浏览器复刻控制台 UI 抓包后确认，
+此前「API 发不了付费」的结论是错的，错在载荷形状）：
+
+1. `payMode` / `payDetail` / `needEncrypt` 必须在 **`fields.common` 里面**。
+   放在 submit 载荷**顶层会被静默丢弃**——返回 200、无报错、按免费收审。
+2. `payDetail` 元素的金额键是 **`price`**（不是 `amount`），单位**分**。
+3. 周期键是 snake_case 的 **`duration_days`**（不是 `durationDays`）；买断写 `0`。
+
+控制台同款载荷（¥29 买断）：
+
+```json
+"fields": {"common": {..., "payMode": 1,
+                      "payDetail": [{"price": 2900, "duration_days": 0}],
+                      "needEncrypt": true}}
+```
+
+**两条平台侧铁律**（改不了，只能顺着来）：
+
+- **付费方式过审后不可更改** → 第一次提交就要定对；
+- **已过审的免费资产不能转付费** → 想收费就得在还是 draft / 待审时改，
+  走 `withdraw` 退回 draft 后重新 `publish` 带上 `--pay`。
+
+所以 `upload_and_submit()` 的行为是：带 `pay_mode` 提交 → **回读 `payMode` 验证** →
+没生效先试 `/pay` 兜底（已知不可靠）→ 仍不行就自动 `withdraw` 撤回并报错，
+**绝不留下一个「本应收费却免费」的待审版本**。
+
+想让资产从免费变收费、而它已经过审：`withdraw` 没用（过审后不归它管），
+只能删掉重建，或者等下个版本用新资产。这是平台约束，不是脚本能绕的。
 
 ### 撤回 open.workbuddy 的待审版本
 
@@ -295,7 +411,8 @@ commit 元数据里的姓名 / 邮箱写进去几乎删不掉（`force push` 只
 
 ```
 用户：会话失效了 / 帮我重新登录
-代理：release.py login --timeout 600
+代理：release.py login --refresh      # 先试这条：profile 里往往还有活会话
+      → 若 --refresh 也报失效，才 release.py login --timeout 600
       → 弹窗停在登录页，只说一句「请扫码」
       → 扫完自动抓 cookie + UA + party_id，然后 release.py probe 复核
       ⚠️ 不要让用户导 HAR、不要让他手抄 Cookie
@@ -309,6 +426,49 @@ commit 元数据里的姓名 / 邮箱写进去几乎删不掉（`force push` 只
       → 先看 payMode：已上架的免费资产平台不支持转付费，要收费只能新发资产
       → 再看周留存：留存个位数的资产没有复购理由，买断比订阅现实
       → 装机高但留存低 = 选题好、交付完就走，别指望在同一资产上收钱
+```
+
+**场景七：发一个收费技能（全自动，不用人点控制台）**
+
+```
+用户：这个技能卖 29 块，发到 open.workbuddy
+代理：release.py publish <技能目录> --targets workbuddy --pay buyout --price 29   # 演练
+      → 确认无误后加 --yes
+      → 发完立刻 release.py pay <技能目录> 回读，确认服务端记的是 ¥29 而不是免费
+      ⚠️ 付费是版本级属性、过审即锁死：定错价只能 withdraw 回 draft 重发
+      ⚠️ 已过审的免费资产转不了付费，别答应用户「上线后再改价」
+```
+
+**场景八：定价没生效，明明设了 29 元却显示免费**
+
+```
+用户：我的技能设了 29，怎么是免费
+代理：release.py pay <技能目录>              # 先看服务端到底记了什么
+      → payMode=0：payload 位置错了（payMode 必须在 fields.common 里，
+        payDetail 用 price + duration_days），本技能已内置正确形状
+      → 需要改：withdraw 回 draft，再 publish --pay buyout --price 29
+```
+
+**场景九：发完之后不用管了（开巡航）**
+
+```
+用户：发了就行，过了审帮我上架
+代理：release.py publish <技能目录> --targets workbuddy --yes
+      → 结果里 watched: true 说明已登记进巡航列表
+      → 建/唤醒一个每日任务跑：release.py watch --check --ship --json
+      → 任务 prompt 里写死：done=true 就把自己 PAUSED，并报「巡航结束」
+      → 下次再发布时，看到 watched: true 就把它 ACTIVE 回来
+```
+
+**场景十：资产一直不出现，怀疑过审了没上架**
+
+```
+用户：审核说通过了，市场里搜不到
+代理：release.py watch                      # 先看它还在不在列表里
+      → 不在列表：手工补登记 watch --asset 不支持新增，用 watchlist.add()
+      → 在列表且 lastStatus=approved：release.py watch --check --ship 立刻上线
+      → 状态 approved 但 --ship 报错：改用 release.py ship --yes 兜底，
+        然后把报错记进 references/troubleshooting.md
 ```
 
 ## 三个平台的通道性质
@@ -384,6 +544,7 @@ GitHub 不消费图标。图不合规会在发布时报错（尺寸/大小前置
 |---|---|
 | [platforms.md](./references/platforms.md) | 需要每条规则的出处、平台通道细节、两个平台各自卡什么 |
 | [commands.md](./references/commands.md) | 需要完整参数、退出码、JSON 输出结构 |
+| [cruise.md](./references/cruise.md) | 要挂巡航定时任务、状态判错、`approved` 卡住不动的排查 |
 | [troubleshooting.md](./references/troubleshooting.md) | 命令报错、上传被拒、open.workbuddy 请求体需要现场校准 |
 
 ## 输出约定

@@ -106,6 +106,13 @@ tags / license / homepage / changelog`。
 （返回 `slug` / `banned` / `status`）。**发布前先查一次**，
 能避免「以为在新建，其实是在更新」或者反过来。
 
+**付费（1.5.6 起）**：个人可发布 Pay Skill（SkillPay 个人入驻 = 手机号验证码，
+`GET /api/v1/aipay/status` 查状态）。只有**按次调用**一种形态（x402）：
+payload 带 `pricing:{billingType:"per_call", pricingMode:"unified", pricePerCall:"0.10", currency:"CNY"}`，
+展示区间 0.01–100 元/次；提交前官方预检 `POST /api/v1/paid-skills/precheck`
+要求 SKILL.md 描述真实 402 收费链路 —— **纯知识包发不了付费**，需要后端服务。
+买断/订阅只能在后端自己实现（首单发 license key）。细节见 commands.md。
+
 `slug` / `displayName` 属于平台元数据，社区惯例是**不写进源 SKILL.md**，
 发布前注入临时副本。本技能照此实现。
 
@@ -327,6 +334,48 @@ fields 推断，**未实测** —— 别在审核中的资产上赌它。
 **层级怎么数**：`douyin-downloader/scripts/douyin.py` 是 3 段，**合规**；
 `douyin-downloader/scripts/_sign/sm3.py` 是 4 段，**超限**。
 所以规则引擎判定的是「相对技能根目录的路径段数 ≤ 2」。
+
+### 付费（版本级属性，纯 API 可设）
+
+`payMode` 挂在**版本**上：`0=免费 1=一次性买断 2=月订阅`，金额单位**分**。
+
+提交载荷（2026-10-26 无头浏览器复刻控制台 UI 抓包确认，¥29 买断）：
+
+```json
+{
+  "capabilityType": "skill", "assetId": "os_...", "uploadToken": "...",
+  "fields": {
+    "common": {
+      "categories": [{"categoryId": "tools:office"}],
+      "marketCategories": ["development-tools"],
+      "payMode": 1,
+      "payDetail": [{"price": 2900, "duration_days": 0}],
+      "needEncrypt": true
+    }
+  }
+}
+```
+
+三个键位错一个都会**静默按免费**（200、无报错），这是「API 发不了付费」那次
+误判的真正原因：
+
+| 易错点 | 正确 |
+|---|---|
+| `payMode` 放载荷顶层 | 放 `fields.common` 里 |
+| `payDetail[].amount` | `payDetail[].price` |
+| `payDetail[].durationDays` | `payDetail[].duration_days` |
+
+平台侧另有三条不可绕的约束：
+
+1. **付费方式过审后不可更改** —— 首次提交定档；
+2. **已过审的免费资产不能转付费** —— 想收费必须在 draft / 待审阶段改；
+3. `POST /capabilities/{assetId}/pay` 是控制台「付费设置」的通道，但实测对
+   draft / under_review 常回 `update goods failed`，不可依赖 —— 正路是随
+   `submit` 一起发。
+
+`pay_state()` 负责回读 `pendingVersion.payMode / payDetail` 做核验
+（CLI：`release.py pay <技能目录>`）；`upload_and_submit()` 在发现没生效时
+会自动 `withdraw` 撤回并报错，避免「本该收费却免费」的版本躺在审核队列里。
 
 ### 待现场确认的部分
 
