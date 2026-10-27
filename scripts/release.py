@@ -32,7 +32,7 @@ import pack                       # noqa: E402
 import rules                      # noqa: E402
 import watchlist                  # noqa: E402
 
-__version__ = "1.5.11"
+__version__ = "1.5.13"
 
 DEFAULT_WORKDIR = Path.home() / ".workbuddy" / ".release"
 VERSION_FILE = "VERSION.txt"
@@ -120,6 +120,13 @@ def bump_version(skill_dir: Path, kind: str) -> str:
     text = md.read_text(encoding="utf-8")
     data = fm_mod.parse_frontmatter(text)
     cur = str(data.get("version") or "0.0.0").strip()
+    # 取证插桩（2026-10-27：发布出现两次「+2 跳版」，bump 本体复现只有 +1，
+    # 怀疑有第二个调用方）。打印调用栈 + 升版前后值，下次再跳就能当场定位。
+    import traceback
+
+    caller = "".join(traceback.format_stack(limit=4)[:-1])
+    print(f"[bump] {cur} -> 计算中（调用方：{caller.strip().splitlines()[-1].strip()}）",
+          file=sys.stderr)
     parts = [int(x) for x in cur.split(".")[:3]] + [0, 0, 0]
     idx = {"major": 0, "minor": 1, "patch": 2}[kind]
     parts[idx] += 1
@@ -1139,10 +1146,11 @@ def cmd_publish(args) -> int:
     quiet = bool(opt(args, "quiet", False))
 
     if args.bump:
+        pre = str(skill["fm"].get("version") or "?")
         new = bump_version(skill["dir"], args.bump)
         skill = load_skill(skill["dir"])
         if not quiet:
-            print(f"版本号 {skill['version']} → {new}（已同步 SKILL.md / "
+            print(f"版本号 {pre} → {new}（已同步 SKILL.md / "
                   f"{VERSION_FILE} / 脚本 __version__）")
 
     slugs = resolve_slugs(skill, cfg, getattr(args, "slug", "") or "")
