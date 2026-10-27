@@ -1006,6 +1006,45 @@ def test_ceiling_gate() -> None:
           "pay-no-audience" in src and "pay-ceiling" in src)
 
 
+def test_cross_references() -> None:
+    """交叉引用完整性 —— 回归 2026-10-27「内置文件缺失」驳回（1.5.7）。
+
+    cruise.md 引用了从未建过的 references/rejection-codes.md，
+    平台质检逐个核对包内 md 的相对引用，缺一个整包驳回。
+    """
+    import rules
+    import tempfile
+
+    check("cross_reference_dangles 已导出", "cross_reference_dangles" in rules.__all__)
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        (td / "references").mkdir()
+        (td / "references" / "a.md").write_text(
+            "see references/b.md and https://x.cn/references/c.md"
+            " and [d](references/d.md) and real: references/a.md\n",
+            encoding="utf-8")
+        dangles = rules.cross_reference_dangles(td)
+        pairs = set(dangles)
+        check("悬空引用被抓住（b/d 缺失）",
+              ("references/a.md", "references/b.md") in pairs and
+              ("references/a.md", "references/d.md") in pairs, str(dangles))
+        check("URL 里的路径不算引用",
+              ("references/a.md", "references/c.md") not in pairs)
+        check("存在的文件不算悬空",
+              ("references/a.md", "references/a.md") not in pairs)
+        # analyze 集成：workbuddy 目标下应产生 dangling-ref 的 block 级 finding
+        fm = {"name": "t", "version": "1.0.0", "display_name": "T",
+              "description": "d"}
+        inv, findings = rules.analyze(td, fm, ("workbuddy",), "author", "t")
+        hit = [f for f in findings if f.code == "dangling-ref"]
+        check("analyze 产出 dangling-ref 阻断项（每条悬空一条）",
+              len(hit) == 2 and all(f.blocks for f in hit), str(hit))
+        # 补上文件后消解
+        (td / "references" / "b.md").write_text("x", encoding="utf-8")
+        (td / "references" / "d.md").write_text("x", encoding="utf-8")
+        check("补文件后 dangles 清空", rules.cross_reference_dangles(td) == [])
+
+
 def test_pay_contract() -> None:
     """付费提交契约 —— 回归 2026-10-26「API 发不了付费技能」那次误判。
 
@@ -1388,6 +1427,7 @@ def main() -> int:
         test_har_extraction(tmp_root)
         test_workbuddy_upload_contract()
         test_pay_contract()
+        test_cross_references()
         test_skillhub_pay_contract()
         test_category_storage()
         test_watch_contract()

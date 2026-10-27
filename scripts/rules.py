@@ -23,8 +23,13 @@ __all__ = [
     "Finding", "Inventory", "analyze", "render_report",
     "PLATFORMS", "PLATFORM_LABEL",
     "EXCLUDE_DIRS", "EXCLUDE_SUFFIXES", "EXCLUDE_NAMES",
-    "MAX_DEPTH", "collect_files",
+    "MAX_DEPTH", "collect_files", "cross_reference_dangles",
 ]
+
+# 包内 md 里写的包相对路径引用，如 references/xxx.md、scripts/yyy.py。
+# 只认官方文档列出的三个二级目录前缀，避免把正文里的普通词组当路径。
+_CROSS_REF_RE = re.compile(
+    r"(?<![\w/])((?:references|scripts|templates)/[A-Za-z0-9._\-]+\.[A-Za-z0-9]{1,5})")
 
 PLATFORMS = ("github", "skillhub", "workbuddy")
 PLATFORM_LABEL = {
@@ -341,6 +346,15 @@ def analyze(skill_dir: Path, frontmatter_data: dict[str, object] | None = None,
                 f"（{'、'.join(sorted(doc_dirs))}）", "assumed",
                 "文档没说必须是这三个，且实测未报错；对齐命名可减少解析告警")
 
+        # 交叉引用完整性：平台质检会扫包内 md 的相对路径引用并逐个核对
+        # 文件存在（2026-10-27 实测驳回：「内置文件缺失：
+        # references/rejection-codes.md（references/cruise.md 引用）」）。
+        for src_rel, target in cross_reference_dangles(skill_dir):
+            add("block", "workbuddy", "dangling-ref",
+                f"`{src_rel}` 引用了包里不存在的 `{target}`", "verified",
+                "补上被引用的文件，或删掉/改写这条引用"
+                "（对照 references/rejection-codes.md 第 2 条）")
+
     # ---------------- 目录卫生 ----------------
     if inv.empty_dirs:
         add("info", "common", "empty-dirs",
@@ -368,6 +382,41 @@ def analyze(skill_dir: Path, frontmatter_data: dict[str, object] | None = None,
                     "（不允许的文件类型: icon.png），发布后在详情页设 iconUrl")
 
     return inv, findings
+
+
+def cross_reference_dangles(skill_dir: Path) -> list[tuple[str, str]]:
+    """扫描包内所有 .md 的包相对路径引用，返回悬空引用 [(来源文件, 目标)]。
+
+    平台质检（2026-10-27 实测）会核对「references/xxx.md（yyy.md 引用）」
+    这类交叉引用的目标文件是否存在，缺一个就整包驳回（rejectStage=quality）。
+    所以提交前本地先查一遍。URL 里的路径（https://…/references/…）不算引用。
+    """
+    dangles: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for root, dirs, files in os.walk(skill_dir):
+        dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+        for name in files:
+            p = Path(root) / name
+            if p.suffix.lower() not in (".md", ".txt"):
+                continue
+            try:
+                text = p.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            src_rel = p.relative_to(skill_dir).as_posix()
+            for m in _CROSS_REF_RE.finditer(text):
+                target = m.group(1)
+                # 命中位置往前看：紧跟在 "://" 后面的是 URL 的一部分，跳过
+                before = text[max(0, m.start() - 8):m.start()]
+                if "://" in before:
+                    continue
+                if (skill_dir / target).is_file():
+                    continue
+                key = (src_rel, target)
+                if key not in seen:
+                    seen.add(key)
+                    dangles.append(key)
+    return dangles
 
 
 def _semver_ok(ver: str) -> bool:
