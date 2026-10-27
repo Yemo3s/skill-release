@@ -32,7 +32,7 @@ import pack                       # noqa: E402
 import rules                      # noqa: E402
 import watchlist                  # noqa: E402
 
-__version__ = "1.5.7"
+__version__ = "1.5.9"
 
 DEFAULT_WORKDIR = Path.home() / ".workbuddy" / ".release"
 VERSION_FILE = "VERSION.txt"
